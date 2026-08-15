@@ -21,22 +21,65 @@ Run these checks with Bash and stop with a clear explanation if any fail -- don'
 silently fall back to something riskier:
 
 - `git rev-parse --is-inside-work-tree` -- confirms this is a git repo.
-- `command -v codex` (or `where codex` on Windows) -- confirms the Codex CLI is
-  installed. If missing, tell the user to install it rather than trying to
-  substitute something else.
+- `command -v codex` and `command -v claude` (or `where` on Windows) -- confirms
+  both CLIs are installed. If either is missing, tell the user rather than trying
+  to substitute something else.
 - `git status --porcelain` on the current tree -- just informational. Uncommitted
   changes here are fine and untouched by this skill (everything happens in a
   separate worktree), but mention them to the user if there's a lot, since they
   won't be visible from inside the worktree.
 
-## Step 1 -- Plan
+## Pipeline shape: three separate headless stages
 
-Produce the implementation plan the same way you normally would (this skill isn't
-a replacement for planning quality, just for the handoff after). Make sure the
-plan is concrete enough that an agent with no memory of this conversation could
-follow it: name the files involved, the behavior expected, and how to verify it
-worked (tests to run, commands to try). Codex will receive only what you write
-down here -- it doesn't have this conversation's context.
+This is a fully headless pipeline, not "this conversation plans and reviews,
+Codex just codes." Each of the three stages below -- plan, implement, review --
+runs as its own subprocess with its own pinned model and reasoning effort, so
+the cost/quality tradeoff per stage is explicit and doesn't depend on whatever
+this orchestrating session happens to be running at. Default pins (override if
+the user asks for different ones for a given task):
+
+| Stage  | Command    | Model         | Effort   |
+|--------|------------|---------------|----------|
+| Plan   | `claude -p`| `sonnet`      | `high`   |
+| Code   | `codex exec` | `gpt-5.6-sol` | `medium` |
+| Review | `claude -p`| `sonnet`      | `medium` |
+
+The orchestrating session (you, running this skill) still does the judgment
+work a subprocess can't: deciding when the loop is done, creating/cleaning up
+the worktree, committing (Codex's sandbox can't, see Step 3), and reporting
+back to the user. It just doesn't do the planning or reviewing *itself* --
+it dispatches those too, the same way it dispatches the coding.
+
+## Step 1 -- Plan (headless, sonnet/high)
+
+Run from the **original repo directory** (not the worktree -- it doesn't exist
+yet), in read-only planning mode so this stage can only investigate, not edit.
+Write the plan to a temp file, not into the repo itself -- these intermediate
+artifacts are scratch, not something that should show up as an untracked file
+in the user's working tree:
+
+```bash
+plan_file="$(mktemp -t codex-handoff-plan-XXXX)"
+
+claude -p --model sonnet --effort high --permission-mode plan "$(cat <<'EOF'
+Plan an implementation for the following task in this repository. You have no
+memory of any prior conversation about it, so investigate the codebase
+yourself first (read the relevant files, follow existing conventions) before
+writing the plan.
+
+Task: <the user's task description>
+
+Produce a concrete, self-contained implementation plan: name the exact files
+involved, the behavior expected, and how to verify it worked (tests/commands
+to run). An agent with no other context needs to be able to follow it exactly.
+Do not implement anything -- plan only.
+EOF
+)" < /dev/null > "$plan_file"
+```
+
+Read `$plan_file` back before moving on -- if it's vague, underspecified, or the
+model asked a clarifying question instead of producing a plan, that's worth
+noticing now rather than after Codex has already run on a bad plan.
 
 ## Step 2 -- Isolate: create a worktree + branch
 
@@ -66,18 +109,22 @@ what you'll report back to the user at the end.
 If `git worktree add` fails (e.g. branch name collision, dirty submodules), report
 the actual error to the user rather than retrying blindly.
 
-## Step 3 -- Delegate to Codex
+## Step 3 -- Delegate to Codex (headless, gpt-5.6-sol/medium)
 
 Run Codex non-interactively, scoped to the new worktree, with the sandbox set to
-allow file writes:
+allow file writes, and the model/effort pinned explicitly (don't rely on
+whatever's in the user's global `~/.codex/config.toml` -- pin it here so this
+stage's behavior doesn't silently change if that default is edited later):
 
 ```bash
-codex exec -s workspace-write -C "<worktree-path>" -o "<worktree-path>/.codex-last-message.txt" "$(cat <<'EOF'
+codex exec -s workspace-write -C "<worktree-path>" \
+  -c model="gpt-5.6-sol" -c model_reasoning_effort="medium" \
+  -o "<worktree-path>/.codex-last-message.txt" "$(cat <<EOF
 Implement the following plan in this repository, and run any relevant
 tests/checks yourself to confirm it works. Leave the changes as edited files --
 you do not need to commit.
 
-<paste the full plan here>
+$(cat "$plan_file")
 EOF
 )" < /dev/null
 ```
@@ -105,21 +152,38 @@ sense -- if its sandbox couldn't run them either (missing interpreter, missing
 dependency, etc.), say so plainly rather than assuming they passed, and run them
 yourself if you can.
 
-## Step 4 -- Review
+## Step 4 -- Review (headless, sonnet/medium)
 
-Review the diff yourself, in the worktree, on its own merits -- don't assume
-Codex's summary is accurate, check the actual commits:
+Don't just trust Codex's self-report -- dispatch a fresh, independent review
+pass over the actual diff, run from inside the worktree so it can also read
+surrounding code for context, not just the patch text:
 
 ```bash
-git -C "<worktree-path>" log --oneline <base-branch>..HEAD
-git -C "<worktree-path>" diff <base-branch>...HEAD
+cd "<worktree-path>"
+review_file="$(mktemp -t codex-handoff-review-XXXX)"
+claude -p --model sonnet --effort medium --permission-mode plan "$(cat <<EOF
+Review this diff against the plan it was supposed to implement. Read
+surrounding code as needed for context -- don't judge the diff in isolation.
+
+Plan:
+$(cat "$plan_file")
+
+Diff:
+$(git diff <base-branch>...HEAD)
+
+Report: does it actually implement the plan, any correctness bugs, any
+scope creep (files touched the plan didn't call for), and whether the
+tests/checks the plan called for were actually run and passed (say plainly if
+you can't tell, don't assume). End with a one-line verdict: CLEAN or
+NEEDS-FIXES.
+EOF
+)" < /dev/null > "$review_file"
+cd -
 ```
 
-If this repo has a `/code-review` (or similarly named) skill/command available,
-prefer using it against this diff -- it's more thorough than a first-pass manual
-read. Otherwise review directly for: does it actually implement the plan,
-correctness bugs, obvious scope creep (files touched that the plan didn't call
-for), and whether tests/checks the plan mentioned were actually run and passed.
+Read `$review_file` yourself before deciding what to do next -- you're the one
+accountable to the user for the final call, the subprocess is an input to that
+judgment, not a replacement for it.
 
 ## Step 5 -- Loop on real issues
 
