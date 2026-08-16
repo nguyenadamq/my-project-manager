@@ -6,7 +6,7 @@
     "dev": "pnpm --parallel --filter @pm/server --filter @pm/web dev",
     "build": "pnpm -r build",
     "typecheck": "pnpm --filter @pm/shared build && pnpm --filter @pm/server typecheck && pnpm --filter @pm/web typecheck",
-    "test": "pnpm -r test",
-    "lint": "pnpm -r lint"
+    "test": "pnpm --filter @pm/shared build && pnpm --filter @pm/server test && pnpm --filter @pm/web test",
+    "lint": "pnpm --filter @pm/shared build && pnpm --filter @pm/server lint && pnpm --filter @pm/web lint"
   }
 }
