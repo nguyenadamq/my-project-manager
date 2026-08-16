@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+*.db
+*.db-shm
+*.db-wal
+coverage/
+*.tsbuildinfo
+.pm/
+apps/web/dev-dist/

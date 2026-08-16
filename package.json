@@ -1,0 +1,12 @@
+{
+  "name": "my-project-manager",
+  "private": true,
+  "packageManager": "pnpm@11.19.0",
+  "scripts": {
+    "dev": "pnpm --parallel --filter @pm/server --filter @pm/web dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm --filter @pm/shared build && pnpm --filter @pm/server typecheck && pnpm --filter @pm/web typecheck",
+    "test": "pnpm -r test",
+    "lint": "pnpm -r lint"
+  }
+}
