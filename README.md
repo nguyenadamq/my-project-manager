@@ -60,7 +60,7 @@ All `/api/*` routes except `/api/health` require `Authorization: Bearer <PM_AUTH
 
 ## Safety and operations
 
-Projects may live anywhere beneath a path listed in `PM_ALLOWED_ROOTS`; they do not need to be inside the Project Manager source directory. Register a repository by entering or selecting its local path in the app. Implementation runs in a dedicated Git worktree and branch. The app never merges, deletes the source repository, or pushes agent-created branches. Failed job worktrees are retained for inspection.
+Projects may live anywhere beneath a path listed in `PM_ALLOWED_ROOTS`; they do not need to be inside the Project Manager source directory. Register a repository by entering its absolute local path in the app. Implementation runs in a dedicated Git worktree and branch. The app never merges, deletes the source repository, or pushes agent-created branches. Failed job worktrees are retained for inspection.
 
 Back up the database while the service is stopped by copying the configured `PM_DATABASE_PATH`. Restore it to the same path before restarting. For remote access, bind to the host's Tailscale interface and keep bearer authentication enabled; do not expose this execution service directly to the public internet.
 
