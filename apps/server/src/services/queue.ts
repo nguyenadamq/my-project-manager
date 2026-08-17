@@ -1,93 +1,192 @@
-import { execFile } from "node:child_process";
-import fs from "node:fs/promises";
-import path from "node:path";
-import { promisify } from "node:util";
 import { nanoid } from "nanoid";
-import type { QueuedPrompt } from "@pm/shared";
+import type { PipelineDefaults, PipelineEvent, PipelineOverrides, PipelineStage, QueuedPrompt, QueueStatus } from "@pm/shared";
 import type { Db } from "../db.js";
 import type { EventHub } from "../events.js";
-import { git, writeTrigger } from "./git.js";
+import { createWorktree, git, writeTrigger } from "./git.js";
+import type { PipelineRunner, ReviewResult } from "./pipeline-runner.js";
+import type { SettingsService } from "./settings.js";
 
-const exec = promisify(execFile);
-const selectQueue = `SELECT id,project_id projectId,text,position,status,created_at createdAt,started_at startedAt,finished_at finishedAt,result_branch resultBranch,result_diff_summary resultDiffSummary,error_message errorMessage FROM queued_prompts`;
+const activeStatuses: QueueStatus[] = ["planning", "implementing", "reviewing", "fixing"];
+const selectQueue = `SELECT id,project_id projectId,text,position,status,created_at createdAt,started_at startedAt,finished_at finishedAt,result_branch resultBranch,result_diff_summary resultDiffSummary,error_message errorMessage,needs_attention needsAttention,worktree_path worktreePath,base_sha baseSha,plan_text planText,plan_original_text planOriginalText,plan_approved_at planApprovedAt,fix_rounds_used fixRoundsUsed,review_verdict reviewVerdict,review_notes reviewNotes,run_overrides runOverrides,plan_model planModel,plan_effort planEffort,implement_model implementModel,implement_effort implementEffort,review_model reviewModel,review_effort reviewEffort FROM queued_prompts`;
 
-export interface PromptRunner { run(repo: string, promptId: string, prompt: string): Promise<{ branch: string; summary: string }>; }
-
-export class ClaudePromptRunner implements PromptRunner {
-  async run(repo: string, promptId: string, prompt: string) {
-    const branch = `pm/${promptId}`;
-    const worktree = path.join(repo, ".pm", "worktrees", promptId);
-    await fs.mkdir(path.dirname(worktree), { recursive: true });
-    await exec("git", ["-C", repo, "worktree", "add", "-b", branch, worktree, "HEAD"]);
-    try {
-      await exec("claude", ["-p", prompt, "--output-format", "json", "--permission-mode", "acceptEdits"], { cwd: worktree, maxBuffer: 8_000_000 });
-      const status = await git(worktree, ["status", "--porcelain"]);
-      if (status) {
-        await git(worktree, ["add", "-A"]);
-        await git(worktree, ["commit", "-m", `pm: execute prompt ${promptId}`]);
-      }
-      const summary = await git(worktree, ["diff", "--stat", "HEAD~1", "HEAD"]).catch(() => "No file changes were produced.");
-      return { branch, summary };
-    } catch (error) {
-      throw new Error(`Claude Code job failed; worktree retained at ${worktree}: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
+function mapPrompt(row: Record<string, unknown> | undefined): QueuedPrompt | null {
+  if (!row) return null;
+  return {
+    ...row,
+    needsAttention: Boolean(row.needsAttention),
+    runOverrides: row.runOverrides ? JSON.parse(String(row.runOverrides)) as PipelineOverrides : null,
+  } as QueuedPrompt;
 }
 
 export class QueueService {
   private runningProjects = new Set<string>();
   private runningGlobal = 0;
-  constructor(private db: Db, private events: EventHub, private runner: PromptRunner, private concurrency = 1) {}
+  private slotWaiters: Array<() => void> = [];
 
-  list(projectId: string): QueuedPrompt[] { return this.db.prepare(`${selectQueue} WHERE project_id=? ORDER BY position,created_at`).all(projectId) as unknown as QueuedPrompt[]; }
-  add(projectId: string, text: string): QueuedPrompt {
+  constructor(private db: Db, private events: EventHub, private runner: PipelineRunner, private settings: SettingsService, private concurrency = 1) {}
+
+  private get(id: string) { return mapPrompt(this.db.prepare(`${selectQueue} WHERE id=?`).get(id) as Record<string, unknown> | undefined); }
+  list(projectId: string): QueuedPrompt[] { return (this.db.prepare(`${selectQueue} WHERE project_id=? ORDER BY position,created_at`).all(projectId) as Record<string, unknown>[]).map((row) => mapPrompt(row)!); }
+
+  add(projectId: string, text: string, runOverrides?: PipelineOverrides): QueuedPrompt {
     if (!text.trim()) throw new Error("Prompt text is required");
-    const exists = this.db.prepare("SELECT 1 FROM projects WHERE id=?").get(projectId);
-    if (!exists) throw new Error("Project not found");
-    const position = ((this.db.prepare("SELECT COALESCE(MAX(position),0) value FROM queued_prompts WHERE project_id=?").get(projectId) as any).value as number) + 1;
+    if (!this.db.prepare("SELECT 1 FROM projects WHERE id=?").get(projectId)) throw new Error("Project not found");
+    if (runOverrides) this.settings.validate(runOverrides);
+    const position = Number((this.db.prepare("SELECT COALESCE(MAX(position),0) value FROM queued_prompts WHERE project_id=?").get(projectId) as { value: number }).value) + 1;
     const id = nanoid(), now = new Date().toISOString();
-    this.db.prepare("INSERT INTO queued_prompts(id,project_id,text,position,status,created_at) VALUES(?,?,?,?, 'queued',?)").run(id, projectId, text.trim(), position, now);
+    this.db.prepare("INSERT INTO queued_prompts(id,project_id,text,position,status,created_at,run_overrides) VALUES($id,$projectId,$text,$position,'queued',$createdAt,$overrides)").run({ $id: id, $projectId: projectId, $text: text.trim(), $position: position, $createdAt: now, $overrides: runOverrides ? JSON.stringify(runOverrides) : null });
     this.events.emit({ type: "queue.updated", projectId });
-    return this.db.prepare(`${selectQueue} WHERE id=?`).get(id) as unknown as QueuedPrompt;
+    return this.get(id)!;
   }
+
   update(id: string, patch: { text?: string; position?: number; status?: "cancelled" }): QueuedPrompt {
-    const current = this.db.prepare(`${selectQueue} WHERE id=?`).get(id) as QueuedPrompt | undefined;
-    if (!current) throw new Error("Prompt not found");
-    if (current.status === "running") throw new Error("A running prompt cannot be edited");
-    const count = Number((this.db.prepare("SELECT COUNT(*) value FROM queued_prompts WHERE project_id=?").get(current.projectId) as any).value);
+    const current = this.get(id); if (!current) throw new Error("Prompt not found");
+    if (activeStatuses.includes(current.status)) throw new Error("An active pipeline cannot be edited");
+    if (patch.status === "cancelled" && !["queued", "plan_ready", "review_exhausted", "failed"].includes(current.status)) throw new Error("This prompt cannot be cancelled now");
+    const count = Number((this.db.prepare("SELECT COUNT(*) value FROM queued_prompts WHERE project_id=?").get(current.projectId) as { value: number }).value);
     const position = patch.position === undefined ? current.position : Math.max(1, Math.min(count, patch.position));
     this.db.exec("BEGIN IMMEDIATE");
     try {
       if (position < current.position) this.db.prepare("UPDATE queued_prompts SET position=position+1 WHERE project_id=? AND position>=? AND position<?").run(current.projectId, position, current.position);
       if (position > current.position) this.db.prepare("UPDATE queued_prompts SET position=position-1 WHERE project_id=? AND position>? AND position<=?").run(current.projectId, current.position, position);
-      this.db.prepare("UPDATE queued_prompts SET text=?,position=?,status=? WHERE id=?").run(patch.text?.trim() || current.text, position, patch.status ?? current.status, id);
+      this.db.prepare("UPDATE queued_prompts SET text=?,position=?,status=?,needs_attention=? WHERE id=?").run(patch.text?.trim() || current.text, position, patch.status ?? current.status, patch.status === "cancelled" ? 0 : Number(current.needsAttention), id);
       this.db.exec("COMMIT");
     } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    if (patch.status === "cancelled") this.logEvent(current, "system", "cancelled", "Pipeline cancelled by the user.");
     this.events.emit({ type: "queue.updated", projectId: current.projectId });
-    return this.db.prepare(`${selectQueue} WHERE id=?`).get(id) as unknown as QueuedPrompt;
+    return this.get(id)!;
   }
-  async push(id: string): Promise<void> {
-    const item = this.db.prepare(`${selectQueue} WHERE id=?`).get(id) as QueuedPrompt | undefined;
-    if (!item || item.status !== "queued") throw new Error("Queued prompt not found");
-    if (this.runningProjects.has(item.projectId) || this.runningGlobal >= this.concurrency) throw new Error("Worker is at its concurrency limit");
+
+  editPlan(id: string, text: string) {
+    const item = this.get(id); if (!item || item.status !== "plan_ready") throw new Error("Plan can only be edited while awaiting approval");
+    if (!text.trim()) throw new Error("Plan text is required");
+    this.db.prepare("UPDATE queued_prompts SET plan_text=? WHERE id=?").run(text.trim(), id);
+    this.logEvent(item, "plan", "output", "The user edited Claude's draft plan.");
+    this.events.emit({ type: "queue.updated", projectId: item.projectId });
+    return this.get(id)!;
+  }
+
+  async runPlanStage(id: string): Promise<void> {
+    const item = this.get(id); if (!item || item.status !== "queued") throw new Error("Queued prompt not found");
+    const project = this.db.prepare("SELECT path,pipeline_overrides pipelineOverrides FROM projects WHERE id=?").get(item.projectId) as { path: string; pipelineOverrides: string | null } | undefined;
+    if (!project) throw new Error("Project not found");
+    const config = this.settings.resolve(project.pipelineOverrides, item.runOverrides ? JSON.stringify(item.runOverrides) : null);
+    this.db.prepare("UPDATE queued_prompts SET status='planning',started_at=?,needs_attention=0,error_message=NULL,plan_model=?,plan_effort=?,implement_model=?,implement_effort=?,review_model=?,review_effort=? WHERE id=?").run(new Date().toISOString(), config.plan.model, config.plan.effort, config.implement.model, config.implement.effort, config.review.model, config.review.effort, id);
+    this.progress(item, "planning"); this.logEvent(item, "plan", "started", `Planning with ${config.plan.model} (${config.plan.effort}).`);
+    const release = await this.acquireSlot(item.projectId);
+    try {
+      const plan = await this.runner.plan({ repo: project.path, prompt: item.text, ...config.plan });
+      this.db.prepare("UPDATE queued_prompts SET status='plan_ready',plan_text=?,plan_original_text=?,needs_attention=1 WHERE id=?").run(plan, plan, id);
+      this.logEvent(item, "plan", "completed", "Draft plan completed.");
+      this.logEvent(item, "plan", "awaiting_approval", "Plan is ready for human review and approval.");
+      this.progress(item, "plan_ready");
+    } catch (error) { this.fail(item, "plan", error); } finally { release(); }
+  }
+
+  async approvePlan(id: string): Promise<QueuedPrompt> {
+    const item = this.get(id); if (!item || item.status !== "plan_ready" || !item.planText) throw new Error("Only a completed plan can be approved");
     const project = this.db.prepare("SELECT path FROM projects WHERE id=?").get(item.projectId) as { path: string } | undefined;
     if (!project) throw new Error("Project not found");
-    this.runningProjects.add(item.projectId); this.runningGlobal++;
-    const now = new Date().toISOString();
-    this.db.prepare("UPDATE queued_prompts SET status='running',started_at=? WHERE id=?").run(now, id);
-    this.events.emit({ type: "job.progress", projectId: item.projectId, promptId: id, status: "running" });
+    const created = await createWorktree(project.path, id);
+    this.db.prepare("UPDATE queued_prompts SET worktree_path=?,result_branch=?,base_sha=?,plan_approved_at=?,status='implementing',needs_attention=0 WHERE id=?").run(created.worktree, created.branch, created.baseSha, new Date().toISOString(), id);
+    this.logEvent(item, "plan", "approved", "Plan approved; isolated worktree created.");
+    this.progress(item, "implementing");
+    return this.get(id)!;
+  }
+
+  async runImplementReviewLoop(id: string, automaticFixes = true): Promise<void> {
+    let item = this.get(id);
+    let failureStage: PipelineStage = "implement";
+    if (!item || !["implementing", "fixing"].includes(item.status) || !item.worktreePath || !item.baseSha || !item.planText) throw new Error("Pipeline is not ready to implement");
+    const project = this.db.prepare("SELECT path FROM projects WHERE id=?").get(item.projectId) as { path: string } | undefined;
+    if (!project) throw new Error("Project not found");
+    const release = await this.acquireSlot(item.projectId);
     try {
-      const result = await this.runner.run(project.path, id, item.text);
-      this.db.prepare("UPDATE queued_prompts SET status='done',finished_at=?,result_branch=?,result_diff_summary=? WHERE id=?").run(new Date().toISOString(), result.branch, result.summary, id);
-      this.db.prepare("INSERT INTO usage_events(id,tool,kind,timestamp,note) VALUES(?, 'claude_code','job',?,?)").run(nanoid(), new Date().toISOString(), id);
-      await writeTrigger(project.path);
-      this.events.emit({ type: "job.progress", projectId: item.projectId, promptId: id, status: "done" });
-    } catch (error) {
-      this.db.prepare("UPDATE queued_prompts SET status='failed',finished_at=?,error_message=? WHERE id=?").run(new Date().toISOString(), error instanceof Error ? error.message : String(error), id);
-      this.events.emit({ type: "job.progress", projectId: item.projectId, promptId: id, status: "failed" });
-    } finally {
-      this.runningProjects.delete(item.projectId); this.runningGlobal--;
-      this.events.emit({ type: "queue.updated", projectId: item.projectId });
-    }
+      while (true) {
+        item = this.get(id)!;
+        failureStage = "implement";
+        const isFix = item.status === "fixing";
+        this.db.prepare("UPDATE queued_prompts SET status=? WHERE id=?").run(isFix ? "fixing" : "implementing", id);
+        this.progress(item, isFix ? "fixing" : "implementing");
+        this.logEvent(item, "implement", isFix ? "fix_round_started" : "started", isFix ? `Starting fix round ${item.fixRoundsUsed}.` : `Implementing with ${item.implementModel} (${item.implementEffort}).`);
+        const summary = await this.runner.implement({ worktree: item.worktreePath!, planText: item.planText!, model: item.implementModel!, effort: item.implementEffort!, resume: isFix, feedback: item.reviewNotes ?? undefined });
+        const dirty = await git(item.worktreePath!, ["status", "--porcelain"]);
+        if (dirty) {
+          await git(item.worktreePath!, ["add", "-A"]);
+          await git(item.worktreePath!, ["commit", "-m", isFix ? `pm: fix round ${item.fixRoundsUsed} for ${id}` : `pm: implement ${id}`]);
+        }
+        this.logEvent(item, "implement", "output", summary);
+        this.logEvent(item, "implement", "completed", dirty ? "Implementation changes committed to the pipeline branch." : "Implementation completed without uncommitted changes.");
+
+        this.db.prepare("UPDATE queued_prompts SET status='reviewing' WHERE id=?").run(id);
+        failureStage = "review";
+        this.progress(item, "reviewing"); this.logEvent(item, "review", "started", `Reviewing with ${item.reviewModel} (${item.reviewEffort}).`);
+        // A configurable project test command was considered; v1 gates on a successful Codex exit before independent review.
+        const review = await this.runner.review({ worktree: item.worktreePath!, planText: item.planText!, baseRef: item.baseSha!, model: item.reviewModel!, effort: item.reviewEffort! });
+        this.db.prepare("UPDATE queued_prompts SET review_verdict=?,review_notes=? WHERE id=?").run(review.verdict, review.notes, id);
+        this.logEvent(item, "review", "verdict", `${review.verdict}\n${review.notes}`);
+        if (review.verdict === "CLEAN") { await this.complete(item, project.path); return; }
+
+        item = this.get(id)!;
+        if (automaticFixes && item.fixRoundsUsed < 2) {
+          const nextRound = item.fixRoundsUsed + 1;
+          this.db.prepare("UPDATE queued_prompts SET status='fixing',fix_rounds_used=? WHERE id=?").run(nextRound, id);
+          continue;
+        }
+        this.exhaust(item); return;
+      }
+    } catch (error) { this.fail(item, failureStage, error); } finally { release(); }
+  }
+
+  requestMoreFixes(id: string, instructions?: string): QueuedPrompt {
+    const item = this.get(id); if (!item || item.status !== "review_exhausted") throw new Error("Additional fixes can only be requested after review is exhausted");
+    const round = item.fixRoundsUsed + 1;
+    const feedback = [item.reviewNotes, instructions?.trim()].filter(Boolean).join("\n\nAdditional human instructions:\n");
+    this.db.prepare("UPDATE queued_prompts SET status='fixing',fix_rounds_used=?,review_notes=?,needs_attention=0 WHERE id=?").run(round, feedback, id);
+    this.logEvent(item, "implement", "fix_round_started", `Human requested fix round ${round}.`);
+    this.progress(item, "fixing"); return this.get(id)!;
+  }
+
+  listEvents(promptId: string): PipelineEvent[] {
+    return this.db.prepare("SELECT id,prompt_id promptId,project_id projectId,stage,kind,message,created_at createdAt FROM pipeline_events WHERE prompt_id=? ORDER BY created_at,id").all(promptId) as unknown as PipelineEvent[];
+  }
+
+  private async complete(item: QueuedPrompt, repo: string) {
+    const stat = await git(item.worktreePath!, ["diff", "--stat", item.baseSha!, "HEAD"]).catch(() => "No diff summary available.");
+    this.db.prepare("UPDATE queued_prompts SET status='done',finished_at=?,needs_attention=0,result_diff_summary=? WHERE id=?").run(new Date().toISOString(), stat, item.id);
+    this.db.prepare("INSERT INTO usage_events(id,tool,kind,timestamp,note) VALUES(?, 'claude_code','job',?,?)").run(nanoid(), new Date().toISOString(), item.id);
+    await writeTrigger(repo);
+    this.logEvent(item, "review", "completed", "Independent review passed. Branch is ready for human inspection."); this.progress(item, "done");
+  }
+
+  private exhaust(item: QueuedPrompt) {
+    this.db.prepare("UPDATE queued_prompts SET status='review_exhausted',needs_attention=1 WHERE id=?").run(item.id);
+    this.logEvent(item, "review", "attention", "Automatic fix limit reached; human direction is required."); this.progress(item, "review_exhausted");
+  }
+
+  private fail(item: QueuedPrompt, stage: PipelineStage, error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    this.db.prepare("UPDATE queued_prompts SET status='failed',finished_at=?,needs_attention=1,error_message=? WHERE id=?").run(new Date().toISOString(), message, item.id);
+    this.logEvent(item, stage, "failed", message); this.logEvent(item, "system", "attention", "Pipeline failed and needs human attention."); this.progress(item, "failed");
+  }
+
+  private progress(item: QueuedPrompt, status: QueueStatus) {
+    this.events.emit({ type: "job.progress", projectId: item.projectId, promptId: item.id, status });
+    this.events.emit({ type: "queue.updated", projectId: item.projectId });
+  }
+
+  private logEvent(item: Pick<QueuedPrompt, "id" | "projectId">, stage: PipelineStage | "system", kind: PipelineEvent["kind"], message: string) {
+    const event: PipelineEvent = { id: nanoid(), promptId: item.id, projectId: item.projectId, stage, kind, message, createdAt: new Date().toISOString() };
+    this.db.prepare("INSERT INTO pipeline_events(id,prompt_id,project_id,stage,kind,message,created_at) VALUES(?,?,?,?,?,?,?)").run(event.id, event.promptId, event.projectId, event.stage, event.kind, event.message, event.createdAt);
+    this.events.emit({ type: "pipeline.event", projectId: event.projectId, promptId: event.promptId, event });
+  }
+
+  private async acquireSlot(projectId: string): Promise<() => void> {
+    while (this.runningProjects.has(projectId) || this.runningGlobal >= this.concurrency) await new Promise<void>((resolve) => this.slotWaiters.push(resolve));
+    this.runningProjects.add(projectId); this.runningGlobal++;
+    return () => {
+      this.runningProjects.delete(projectId); this.runningGlobal--;
+      const waiters = this.slotWaiters.splice(0); for (const wake of waiters) wake();
+    };
   }
 }

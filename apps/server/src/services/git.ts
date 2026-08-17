@@ -40,6 +40,15 @@ export async function writeTrigger(repo: string, sha?: string): Promise<void> {
   await fs.writeFile(path.join(repo, ".pm", "trigger"), `${sha ?? await git(repo, ["rev-parse", "HEAD"])}\n`);
 }
 
+export async function createWorktree(repo: string, promptId: string) {
+  const { sha: baseSha } = await getRepoMetadata(repo);
+  const branch = `pm/${promptId}`;
+  const worktree = path.join(repo, ".pm", "worktrees", promptId);
+  await fs.mkdir(path.dirname(worktree), { recursive: true });
+  await git(repo, ["worktree", "add", "-b", branch, worktree, "HEAD"]);
+  return { worktree, branch, baseSha };
+}
+
 export async function collectBaseline(repo: string): Promise<string> {
   const [log, files, readme] = await Promise.all([
     git(repo, ["log", "--oneline", "-50"]),

@@ -10,11 +10,14 @@ import { createDatabase, type Db } from "./db.js";
 import { EventHub } from "./events.js";
 import { ProjectService } from "./services/projects.js";
 import { SummaryService } from "./services/summaries.js";
-import { QueueService, ClaudePromptRunner, type PromptRunner } from "./services/queue.js";
+import { QueueService } from "./services/queue.js";
+import { RealPipelineRunner, type PipelineRunner } from "./services/pipeline-runner.js";
+import { SettingsService } from "./services/settings.js";
 import { UsageService } from "./services/usage.js";
 import { TriggerWatcher } from "./services/watcher.js";
+import type { PipelineOverrides } from "@pm/shared";
 
-export interface BuildOptions { db?: Db; runner?: PromptRunner; startWatcher?: boolean }
+export interface BuildOptions { db?: Db; runner?: PipelineRunner; startWatcher?: boolean }
 
 export async function buildApp(config: Config, options: BuildOptions = {}): Promise<FastifyInstance> {
   const app = Fastify({ logger: process.env.NODE_ENV !== "test" });
@@ -22,7 +25,8 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   const events = new EventHub();
   const projects = new ProjectService(db, config);
   const summaries = new SummaryService(db, events);
-  const queue = new QueueService(db, events, options.runner ?? new ClaudePromptRunner(), config.concurrency);
+  const settings = new SettingsService(db);
+  const queue = new QueueService(db, events, options.runner ?? new RealPipelineRunner(), settings, config.concurrency);
   const usage = new UsageService(db, config, events);
   const watcher = new TriggerWatcher(db, summaries, config.syncDebounceMs);
   const background = new Set<Promise<unknown>>();
@@ -53,6 +57,10 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
     return reply.code(201).send(project);
   });
   app.get<{ Params: { id: string } }>("/api/projects/:id", async (request, reply) => projects.get(request.params.id) ?? reply.code(404).send({ error: "Project not found" }));
+  app.patch<{ Params: { id: string }; Body: { pipelineOverrides: PipelineOverrides | null } }>("/api/projects/:id", async (request) => {
+    if (request.body.pipelineOverrides) settings.validate(request.body.pipelineOverrides);
+    return projects.setPipelineOverrides(request.params.id, request.body.pipelineOverrides);
+  });
   app.delete<{ Params: { id: string } }>("/api/projects/:id", async (request, reply) => {
     const project = projects.get(request.params.id);
     if (!project) return reply.code(404).send({ error: "Project not found" });
@@ -60,12 +68,26 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   });
   app.post<{ Params: { id: string } }>("/api/projects/:id/refresh", async (request, reply) => { await summaries.sync(request.params.id, true); return reply.code(202).send({ accepted: true }); });
   app.get<{ Params: { id: string } }>("/api/projects/:id/queue", async (request) => queue.list(request.params.id));
-  app.post<{ Params: { id: string }; Body: { text: string } }>("/api/projects/:id/queue", async (request, reply) => reply.code(201).send(queue.add(request.params.id, request.body.text)));
+  app.post<{ Params: { id: string }; Body: { text: string; overrides?: PipelineOverrides } }>("/api/projects/:id/queue", async (request, reply) => reply.code(201).send(queue.add(request.params.id, request.body.text, request.body.overrides)));
   app.patch<{ Params: { promptId: string }; Body: { text?: string; position?: number; status?: "cancelled" } }>("/api/queue/:promptId", async (request) => queue.update(request.params.promptId, request.body));
+  app.patch<{ Params: { promptId: string }; Body: { text: string } }>("/api/queue/:promptId/plan", async (request) => queue.editPlan(request.params.promptId, request.body.text));
   app.post<{ Params: { promptId: string } }>("/api/queue/:promptId/push", async (request, reply) => {
-    setImmediate(() => schedule(queue.push(request.params.promptId)));
+    setImmediate(() => schedule(queue.runPlanStage(request.params.promptId)));
     return reply.code(202).send({ accepted: true });
   });
+  app.post<{ Params: { promptId: string } }>("/api/queue/:promptId/approve-plan", async (request, reply) => {
+    await queue.approvePlan(request.params.promptId);
+    setImmediate(() => schedule(queue.runImplementReviewLoop(request.params.promptId)));
+    return reply.code(202).send({ accepted: true });
+  });
+  app.post<{ Params: { promptId: string }; Body: { instructions?: string } }>("/api/queue/:promptId/request-fixes", async (request, reply) => {
+    queue.requestMoreFixes(request.params.promptId, request.body?.instructions);
+    setImmediate(() => schedule(queue.runImplementReviewLoop(request.params.promptId, false)));
+    return reply.code(202).send({ accepted: true });
+  });
+  app.get<{ Params: { promptId: string } }>("/api/queue/:promptId/events", async (request) => queue.listEvents(request.params.promptId));
+  app.get("/api/settings/pipeline", async () => settings.getGlobalDefaults());
+  app.put<{ Body: PipelineOverrides }>("/api/settings/pipeline", async (request) => settings.setGlobalDefaults(request.body));
   app.get("/api/usage", async () => usage.snapshot());
   app.post<{ Body: { note?: string } }>("/api/usage/chatgpt/log", async (request, reply) => { usage.logChatGpt(request.body?.note); return reply.code(201).send({ logged: true }); });
   app.get<{ Querystring: { token?: string } }>("/ws", { websocket: true }, (socket, request) => {

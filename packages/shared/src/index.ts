@@ -1,5 +1,9 @@
 export type ProjectStatus = "active" | "archived";
-export type QueueStatus = "queued" | "running" | "done" | "failed" | "cancelled";
+export type QueueStatus = "queued" | "planning" | "plan_ready" | "implementing" | "reviewing" | "fixing" | "done" | "review_exhausted" | "failed" | "cancelled";
+export type PipelineStage = "plan" | "implement" | "review";
+export interface StageConfig { model: string; effort: string }
+export interface PipelineDefaults { plan: StageConfig; implement: StageConfig; review: StageConfig }
+export type PipelineOverrides = Partial<{ [K in PipelineStage]: Partial<StageConfig> }>;
 
 export interface Feature {
   id: string;
@@ -22,6 +26,32 @@ export interface QueuedPrompt {
   resultBranch: string | null;
   resultDiffSummary: string | null;
   errorMessage: string | null;
+  needsAttention: boolean;
+  worktreePath: string | null;
+  baseSha: string | null;
+  planText: string | null;
+  planOriginalText: string | null;
+  planApprovedAt: string | null;
+  fixRoundsUsed: number;
+  reviewVerdict: "CLEAN" | "NEEDS-FIXES" | null;
+  reviewNotes: string | null;
+  runOverrides: PipelineOverrides | null;
+  planModel: string | null;
+  planEffort: string | null;
+  implementModel: string | null;
+  implementEffort: string | null;
+  reviewModel: string | null;
+  reviewEffort: string | null;
+}
+
+export interface PipelineEvent {
+  id: string;
+  promptId: string;
+  projectId: string;
+  stage: PipelineStage | "system";
+  kind: "started" | "output" | "completed" | "failed" | "awaiting_approval" | "approved" | "fix_round_started" | "verdict" | "attention" | "cancelled";
+  message: string;
+  createdAt: string;
 }
 
 export interface Project {
@@ -37,6 +67,8 @@ export interface Project {
   latestFeatureMd?: string;
   features?: Feature[];
   queue?: QueuedPrompt[];
+  pipelineOverrides?: PipelineOverrides | null;
+  needsAttentionCount?: number;
 }
 
 export interface UsageGauge {
@@ -57,4 +89,5 @@ export type RealtimeEvent =
   | { type: "sync.updated"; projectId: string }
   | { type: "queue.updated"; projectId: string }
   | { type: "job.progress"; projectId: string; promptId: string; status: QueueStatus }
-  | { type: "usage.updated" };
+  | { type: "usage.updated" }
+  | { type: "pipeline.event"; projectId: string; promptId: string; event: PipelineEvent };
