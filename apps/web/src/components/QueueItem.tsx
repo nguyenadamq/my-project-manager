@@ -8,15 +8,36 @@ const labels: Record<QueueStatus, string> = {
   failed: "Failed — needs attention", cancelled: "Cancelled",
 };
 
+type StageState = "" | "active" | "complete" | "failed";
+type Stages = Record<"plan" | "implement" | "review", StageState>;
+
+// Single source of truth for what the three-stage timeline shows: one switch over the
+// authoritative `status`, not independently-hand-maintained index/threshold arithmetic.
+// A 'failed' status is disambiguated using fields that are already on the row (no schema
+// change needed) so a plan-stage failure never renders Implement as falsely complete.
+function stageStates(item: QueuedPrompt): Stages {
+  switch (item.status) {
+    case "queued": return { plan: "", implement: "", review: "" };
+    case "planning": return { plan: "active", implement: "", review: "" };
+    case "plan_ready": return { plan: "complete", implement: "", review: "" };
+    case "implementing": case "fixing": return { plan: "complete", implement: "active", review: "" };
+    case "reviewing": return { plan: "complete", implement: "complete", review: "active" };
+    case "review_exhausted": return { plan: "complete", implement: "complete", review: "failed" };
+    case "done": return { plan: "complete", implement: "complete", review: "complete" };
+    case "failed":
+      if (!item.worktreePath) return { plan: "failed", implement: "", review: "" };
+      if (!item.reviewVerdict) return { plan: "complete", implement: "failed", review: "" };
+      return { plan: "complete", implement: "complete", review: "failed" };
+    default: return { plan: "", implement: "", review: "" }; // cancelled
+  }
+}
+
 function Timeline({ item }: { item: QueuedPrompt }) {
-  const order: QueueStatus[] = ["queued", "planning", "plan_ready", "implementing", "fixing", "reviewing", "done"];
-  const index = item.status === "review_exhausted" || item.status === "failed" ? 5 : order.indexOf(item.status);
+  const states = stageStates(item);
   return <div className="pipeline-timeline">
-    {(["Plan", "Implement", "Review"] as const).map((stage, stageIndex) => {
-      const threshold = [1, 3, 5][stageIndex]!;
-      const complete = stageIndex === 0 ? index >= 2 : stageIndex === 1 ? index >= 5 : item.status === "done";
-      return <span className={complete ? "complete" : index >= threshold ? "active" : ""} key={stage}><i />{stage}</span>;
-    })}
+    {([["plan", "Plan"], ["implement", "Implement"], ["review", "Review"]] as const).map(([key, label]) => (
+      <span className={states[key]} key={key}><i />{label}</span>
+    ))}
     {item.fixRoundsUsed > 0 && <small>{item.fixRoundsUsed} fix round{item.fixRoundsUsed === 1 ? "" : "s"}</small>}
   </div>;
 }

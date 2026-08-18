@@ -23,7 +23,7 @@ beforeEach(() => {
 });
 afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 
-const config = (): Config => ({ host: "127.0.0.1", port: 0, databasePath: path.join(root, "test.db"), authToken: "secret", allowedRoots: [root], concurrency: 1, syncDebounceMs: 0, chatgptWeeklyLimit: 100, chatgptResetDay: 1, claudeFiveHourLimit: 1000 });
+const config = (): Config => ({ host: "127.0.0.1", port: 0, databasePath: path.join(root, "test.db"), authToken: "secret", allowedRoots: [root], concurrency: 1, syncDebounceMs: 0, chatgptWeeklyLimit: 100, chatgptResetDay: 1, claudeFiveHourLimit: 1000, cliTimeoutMs: 60_000 });
 
 describe("API", () => {
   it("enforces authentication", async () => {

@@ -1,10 +1,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { nanoid } from "nanoid";
-import type { PipelineOverrides, Project, QueuedPrompt } from "@pm/shared";
+import type { PipelineOverrides, Project } from "@pm/shared";
 import type { Db } from "../db.js";
 import type { Config } from "../config.js";
 import { assertGitRepository, getRepoMetadata, installPostCommitHook } from "./git.js";
+import { mapPrompt, selectQueue } from "./queue.js";
 
 const mapProject = (row: any): Project => ({
   id: row.id, name: row.name, path: row.path, repoRemote: row.repo_remote, status: row.status,
@@ -13,9 +14,6 @@ const mapProject = (row: any): Project => ({
   pipelineOverrides: row.pipeline_overrides ? JSON.parse(row.pipeline_overrides) : null,
   needsAttentionCount: Number(row.needs_attention_count ?? 0),
 });
-
-const queueProjection = `SELECT id,project_id projectId,text,position,status,created_at createdAt,started_at startedAt,finished_at finishedAt,result_branch resultBranch,result_diff_summary resultDiffSummary,error_message errorMessage,needs_attention needsAttention,worktree_path worktreePath,base_sha baseSha,plan_text planText,plan_original_text planOriginalText,plan_approved_at planApprovedAt,fix_rounds_used fixRoundsUsed,review_verdict reviewVerdict,review_notes reviewNotes,run_overrides runOverrides,plan_model planModel,plan_effort planEffort,implement_model implementModel,implement_effort implementEffort,review_model reviewModel,review_effort reviewEffort FROM queued_prompts`;
-const mapQueueItem = (row: any): QueuedPrompt => ({ ...row, needsAttention: Boolean(row.needsAttention), runOverrides: row.runOverrides ? JSON.parse(row.runOverrides) : null });
 
 export class ProjectService {
   constructor(private db: Db, private config: Config) {}
@@ -29,7 +27,7 @@ export class ProjectService {
     if (!row) return null;
     const project = mapProject(row);
     project.features = this.db.prepare("SELECT id, project_id projectId, title, description, added_at_sha addedAtSha, status FROM features WHERE project_id=? ORDER BY title").all(id) as any;
-    project.queue = (this.db.prepare(`${queueProjection} WHERE project_id=? ORDER BY position,created_at`).all(id) as any[]).map(mapQueueItem);
+    project.queue = (this.db.prepare(`${selectQueue} WHERE project_id=? ORDER BY position,created_at`).all(id) as Record<string, unknown>[]).map((row) => mapPrompt(row)!);
     return project;
   }
 

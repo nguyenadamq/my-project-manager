@@ -62,6 +62,33 @@ describe("prompt queue pipeline", () => {
     expect(approved.status).toBe("implementing"); expect(fs.existsSync(approved.worktreePath!)).toBe(true); expect(approved.resultBranch).toBe(`pm/${item.id}`);
   });
 
+  it("rejects a duplicate concurrent approval with a clear message instead of racing git", async () => {
+    const item = queue.add("p", "Build feature"); await queue.runPlanStage(item.id);
+    const [first, second] = await Promise.allSettled([queue.approvePlan(item.id), queue.approvePlan(item.id)]);
+    const results = [first, second];
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    const rejected = results.find((r): r is PromiseRejectedResult => r.status === "rejected");
+    expect((rejected!.reason as Error).message).toMatch(/completed plan/);
+    expect(queue.list("p")[0]!.status).toBe("implementing");
+  });
+
+  it("stays cancellable while queued behind a busy concurrency slot", async () => {
+    let releaseFirst: () => void = () => {};
+    const stall = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const original = runner.plan.bind(runner);
+    runner.plan = async (input) => { await stall; return original(input); };
+    const busy = queue.add("p", "Busy job"); const waiting = queue.add("p", "Waiting job");
+    const busyRun = queue.runPlanStage(busy.id);
+    await new Promise((resolve) => setImmediate(resolve)); // let the busy job claim the only slot
+    const waitingRun = queue.runPlanStage(waiting.id);
+    // Still queued (not stuck as 'planning') while it waits for the slot, so it can be cancelled.
+    expect(queue.list("p").find((item) => item.id === waiting.id)!.status).toBe("queued");
+    expect(queue.update(waiting.id, { status: "cancelled" }).status).toBe("cancelled");
+    releaseFirst(); await busyRun; await waitingRun;
+    expect(queue.list("p").find((item) => item.id === waiting.id)!.status).toBe("cancelled");
+    runner.plan = original;
+  });
+
   it("runs the happy path without touching main", async () => {
     const item = queue.add("p", "Build feature"); await queue.runPlanStage(item.id); await queue.approvePlan(item.id); await queue.runImplementReviewLoop(item.id);
     const done = queue.list("p")[0]!; expect(done.status).toBe("done"); expect(done.needsAttention).toBe(false); expect(done.reviewVerdict).toBe("CLEAN");
@@ -94,6 +121,14 @@ describe("prompt queue pipeline", () => {
   it("preserves the worktree and stops after a hard failure", async () => {
     const item = queue.add("p", "Build feature"); await queue.runPlanStage(item.id); const approved = await queue.approvePlan(item.id); runner.failAt = "implement"; await queue.runImplementReviewLoop(item.id);
     expect(queue.list("p")[0]).toMatchObject({ status: "failed", needsAttention: true }); expect(fs.existsSync(approved.worktreePath!)).toBe(true); expect(runner.reviewCalls).toBe(0);
+  });
+
+  it("attributes a failure to the stage that actually threw", async () => {
+    const item = queue.add("p", "Build feature"); await queue.runPlanStage(item.id); await queue.approvePlan(item.id);
+    runner.failAt = "review"; await queue.runImplementReviewLoop(item.id);
+    expect(queue.list("p")[0]).toMatchObject({ status: "failed" });
+    const failedEvent = queue.listEvents(item.id).find((event) => event.kind === "failed");
+    expect(failedEvent?.stage).toBe("review");
   });
 
   it("allows plan edits only at the approval gate", async () => {

@@ -28,17 +28,36 @@ export function buildReviewArgs(prompt: string, model: string, effort: string) {
   return ["-p", prompt, "--model", model, "--effort", effort, "--permission-mode", "plan"];
 }
 
+// Scans from the end of the response for a line that is *just* CLEAN or NEEDS-FIXES
+// once markdown emphasis/quote/code-fence punctuation is stripped, rather than requiring
+// literally the last raw line to match. This tolerates a trailing footer, banner, or
+// closing code fence the CLI appends after the model's actual verdict.
+export function extractVerdict(stdout: string): ReviewResult {
+  const lines = stdout.split(/\r?\n/);
+  const clean = (line: string) => line.trim().replace(/^[*_`#>\s-]+|[*_`.\s]+$/g, "");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const token = clean(lines[i]!).toUpperCase();
+    if (token === "CLEAN" || token === "NEEDS-FIXES") {
+      const notes = lines.slice(0, i).join("\n").trim() || token;
+      return { verdict: token as ReviewResult["verdict"], notes };
+    }
+  }
+  throw new Error("Review did not include a CLEAN or NEEDS-FIXES verdict line");
+}
+
 export class RealPipelineRunner implements PipelineRunner {
+  constructor(private timeoutMs?: number) {}
+
   async plan(input: PlanInput) {
     const context = await collectBaseline(input.repo);
     const prompt = `Plan an implementation for this task. Inspect the repository context below. Do not edit files. Produce a concrete plan naming files, behavior, edge cases, and verification.\n\nTASK:\n${input.prompt}\n\nREPOSITORY CONTEXT:\n${context}`;
-    const { stdout } = await runCli("claude", buildPlanArgs(prompt, input.model, input.effort), { cwd: input.repo });
+    const { stdout } = await runCli("claude", buildPlanArgs(prompt, input.model, input.effort), { cwd: input.repo, timeoutMs: this.timeoutMs });
     if (!stdout.trim()) throw new Error("Plan stage returned no output");
     return stdout.trim();
   }
 
   async implement(input: ImplementInput) {
-    const { stdout } = await runCli("codex", buildImplementArgs(input), { cwd: input.worktree });
+    const { stdout } = await runCli("codex", buildImplementArgs(input), { cwd: input.worktree, timeoutMs: this.timeoutMs });
     const outputFile = path.join(input.worktree, ".codex-last-message.txt");
     const captured = await fs.readFile(outputFile, "utf8").catch(() => stdout);
     return captured.trim() || "Codex completed without a summary message.";
@@ -47,11 +66,7 @@ export class RealPipelineRunner implements PipelineRunner {
   async review(input: ReviewInput) {
     const diff = await collectDelta(input.worktree, input.baseRef, "HEAD");
     const prompt = `Review this implementation against the approved plan. Report correctness bugs, missing requirements, scope creep, and verification gaps. End with exactly CLEAN or NEEDS-FIXES on its own final line.\n\nAPPROVED PLAN:\n${input.planText}\n\nIMPLEMENTATION DIFF:\n${diff}`;
-    const { stdout } = await runCli("claude", buildReviewArgs(prompt, input.model, input.effort), { cwd: input.worktree });
-    const lines = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-    const verdict = lines.at(-1);
-    if (verdict !== "CLEAN" && verdict !== "NEEDS-FIXES") throw new Error("Review did not end with a CLEAN or NEEDS-FIXES verdict");
-    const parsed: ReviewResult["verdict"] = verdict;
-    return { verdict: parsed, notes: lines.slice(0, -1).join("\n").trim() || parsed };
+    const { stdout } = await runCli("claude", buildReviewArgs(prompt, input.model, input.effort), { cwd: input.worktree, timeoutMs: this.timeoutMs });
+    return extractVerdict(stdout);
   }
 }

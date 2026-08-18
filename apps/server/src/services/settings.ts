@@ -25,8 +25,18 @@ function merge(base: PipelineDefaults, ...layers: PipelineOverrides[]): Pipeline
 function validate(overrides: PipelineOverrides) {
   for (const stage of stages) {
     const value = overrides[stage];
-    if (value?.model && !PIPELINE_MODELS.includes(value.model)) throw new Error(`Unsupported ${stage} model: ${value.model}`);
-    if (value?.effort && !PIPELINE_EFFORTS.includes(value.effort)) throw new Error(`Unsupported ${stage} effort: ${value.effort}`);
+    if (!value) continue;
+    // Check `!== undefined` (field present) rather than truthiness, so an explicit ""
+    // is rejected here instead of silently passing through and later overwriting a
+    // real default/override with a blank value that the CLI would fail on opaquely.
+    if (value.model !== undefined) {
+      if (!value.model) throw new Error(`${stage} model cannot be empty`);
+      if (!PIPELINE_MODELS.includes(value.model)) throw new Error(`Unsupported ${stage} model: ${value.model}`);
+    }
+    if (value.effort !== undefined) {
+      if (!value.effort) throw new Error(`${stage} effort cannot be empty`);
+      if (!PIPELINE_EFFORTS.includes(value.effort)) throw new Error(`Unsupported ${stage} effort: ${value.effort}`);
+    }
   }
 }
 

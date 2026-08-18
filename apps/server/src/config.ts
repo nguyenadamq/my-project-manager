@@ -11,6 +11,7 @@ export interface Config {
   chatgptWeeklyLimit: number;
   chatgptResetDay: number;
   claudeFiveHourLimit: number;
+  cliTimeoutMs: number;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -25,5 +26,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     chatgptWeeklyLimit: Math.max(1, Number(env.PM_CHATGPT_WEEKLY_LIMIT ?? 1000)),
     chatgptResetDay: Math.min(6, Math.max(0, Number(env.PM_CHATGPT_RESET_DAY ?? 1))),
     claudeFiveHourLimit: Math.max(1, Number(env.PM_CLAUDE_FIVE_HOUR_LIMIT ?? 100_000)),
+    // A hung `claude`/`codex` subprocess would otherwise hold its concurrency slot (and
+    // block every other queued prompt behind it) forever; this is the outer safety net.
+    cliTimeoutMs: Math.max(1, Number(env.PM_CLI_TIMEOUT_MS ?? 20 * 60_000)),
   };
 }

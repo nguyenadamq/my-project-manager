@@ -3,13 +3,13 @@ import type { PipelineDefaults, PipelineEvent, PipelineOverrides, PipelineStage,
 import type { Db } from "../db.js";
 import type { EventHub } from "../events.js";
 import { createWorktree, git, writeTrigger } from "./git.js";
-import type { PipelineRunner, ReviewResult } from "./pipeline-runner.js";
+import type { PipelineRunner } from "./pipeline-runner.js";
 import type { SettingsService } from "./settings.js";
 
 const activeStatuses: QueueStatus[] = ["planning", "implementing", "reviewing", "fixing"];
-const selectQueue = `SELECT id,project_id projectId,text,position,status,created_at createdAt,started_at startedAt,finished_at finishedAt,result_branch resultBranch,result_diff_summary resultDiffSummary,error_message errorMessage,needs_attention needsAttention,worktree_path worktreePath,base_sha baseSha,plan_text planText,plan_original_text planOriginalText,plan_approved_at planApprovedAt,fix_rounds_used fixRoundsUsed,review_verdict reviewVerdict,review_notes reviewNotes,run_overrides runOverrides,plan_model planModel,plan_effort planEffort,implement_model implementModel,implement_effort implementEffort,review_model reviewModel,review_effort reviewEffort FROM queued_prompts`;
+export const selectQueue = `SELECT id,project_id projectId,text,position,status,created_at createdAt,started_at startedAt,finished_at finishedAt,result_branch resultBranch,result_diff_summary resultDiffSummary,error_message errorMessage,needs_attention needsAttention,worktree_path worktreePath,base_sha baseSha,plan_text planText,plan_original_text planOriginalText,plan_approved_at planApprovedAt,fix_rounds_used fixRoundsUsed,review_verdict reviewVerdict,review_notes reviewNotes,run_overrides runOverrides,plan_model planModel,plan_effort planEffort,implement_model implementModel,implement_effort implementEffort,review_model reviewModel,review_effort reviewEffort FROM queued_prompts`;
 
-function mapPrompt(row: Record<string, unknown> | undefined): QueuedPrompt | null {
+export function mapPrompt(row: Record<string, unknown> | undefined): QueuedPrompt | null {
   if (!row) return null;
   return {
     ...row,
@@ -71,32 +71,53 @@ export class QueueService {
     const project = this.db.prepare("SELECT path,pipeline_overrides pipelineOverrides FROM projects WHERE id=?").get(item.projectId) as { path: string; pipelineOverrides: string | null } | undefined;
     if (!project) throw new Error("Project not found");
     const config = this.settings.resolve(project.pipelineOverrides, item.runOverrides ? JSON.stringify(item.runOverrides) : null);
-    this.db.prepare("UPDATE queued_prompts SET status='planning',started_at=?,needs_attention=0,error_message=NULL,plan_model=?,plan_effort=?,implement_model=?,implement_effort=?,review_model=?,review_effort=? WHERE id=?").run(new Date().toISOString(), config.plan.model, config.plan.effort, config.implement.model, config.implement.effort, config.review.model, config.review.effort, id);
-    this.progress(item, "planning"); this.logEvent(item, "plan", "started", `Planning with ${config.plan.model} (${config.plan.effort}).`);
+    // Snapshot the resolved config now, but do NOT flip status off 'queued' yet: the item
+    // must stay cancellable/editable (see update()'s activeStatuses guard) for as long as
+    // it's merely waiting behind another job for a free concurrency slot, not actually
+    // running. Only claim it once the slot is actually acquired, immediately before the
+    // subprocess call that could hang.
+    this.db.prepare("UPDATE queued_prompts SET plan_model=?,plan_effort=?,implement_model=?,implement_effort=?,review_model=?,review_effort=? WHERE id=?").run(config.plan.model, config.plan.effort, config.implement.model, config.implement.effort, config.review.model, config.review.effort, id);
     const release = await this.acquireSlot(item.projectId);
     try {
-      const plan = await this.runner.plan({ repo: project.path, prompt: item.text, ...config.plan });
+      const current = this.get(id);
+      if (!current || current.status !== "queued") return; // cancelled while waiting for a slot
+      this.db.prepare("UPDATE queued_prompts SET status='planning',started_at=?,needs_attention=0,error_message=NULL WHERE id=?").run(new Date().toISOString(), id);
+      this.progress(current, "planning"); this.logEvent(current, "plan", "started", `Planning with ${config.plan.model} (${config.plan.effort}).`);
+      const plan = await this.runner.plan({ repo: project.path, prompt: current.text, ...config.plan });
       this.db.prepare("UPDATE queued_prompts SET status='plan_ready',plan_text=?,plan_original_text=?,needs_attention=1 WHERE id=?").run(plan, plan, id);
-      this.logEvent(item, "plan", "completed", "Draft plan completed.");
-      this.logEvent(item, "plan", "awaiting_approval", "Plan is ready for human review and approval.");
-      this.progress(item, "plan_ready");
-    } catch (error) { this.fail(item, "plan", error); } finally { release(); }
+      this.logEvent(current, "plan", "completed", "Draft plan completed.");
+      this.logEvent(current, "plan", "awaiting_approval", "Plan is ready for human review and approval.");
+      this.progress(current, "plan_ready");
+    } catch (error) { this.fail(this.get(id) ?? item, "plan", error); } finally { release(); }
   }
 
   async approvePlan(id: string): Promise<QueuedPrompt> {
-    const item = this.get(id); if (!item || item.status !== "plan_ready" || !item.planText) throw new Error("Only a completed plan can be approved");
+    // The authorization check and the claim are the same synchronous, conditional UPDATE --
+    // there is no separate check-then-write gap for a second, near-simultaneous approve call
+    // to land in. Whichever call's synchronous statement runs first flips the row to
+    // 'implementing' and gets changes===1; any other call (now or seconds later) matches
+    // zero rows and fails fast with a clear message instead of racing `git worktree add`
+    // for the same branch/path.
+    const claim = this.db.prepare("UPDATE queued_prompts SET status='implementing',needs_attention=0 WHERE id=? AND status='plan_ready'").run(id);
+    if (claim.changes === 0) throw new Error(this.get(id) ? "Only a completed plan can be approved" : "Prompt not found");
+    const item = this.get(id)!;
     const project = this.db.prepare("SELECT path FROM projects WHERE id=?").get(item.projectId) as { path: string } | undefined;
-    if (!project) throw new Error("Project not found");
-    const created = await createWorktree(project.path, id);
-    this.db.prepare("UPDATE queued_prompts SET worktree_path=?,result_branch=?,base_sha=?,plan_approved_at=?,status='implementing',needs_attention=0 WHERE id=?").run(created.worktree, created.branch, created.baseSha, new Date().toISOString(), id);
-    this.logEvent(item, "plan", "approved", "Plan approved; isolated worktree created.");
-    this.progress(item, "implementing");
-    return this.get(id)!;
+    if (!project) { this.db.prepare("UPDATE queued_prompts SET status='plan_ready',needs_attention=1 WHERE id=?").run(id); throw new Error("Project not found"); }
+    try {
+      const created = await createWorktree(project.path, id);
+      this.db.prepare("UPDATE queued_prompts SET worktree_path=?,result_branch=?,base_sha=?,plan_approved_at=? WHERE id=?").run(created.worktree, created.branch, created.baseSha, new Date().toISOString(), id);
+      this.logEvent(item, "plan", "approved", "Plan approved; isolated worktree created.");
+      this.progress(item, "implementing");
+      return this.get(id)!;
+    } catch (error) {
+      // Revert the claim so the plan is retriable rather than stuck in a half-approved state.
+      this.db.prepare("UPDATE queued_prompts SET status='plan_ready',needs_attention=1 WHERE id=?").run(id);
+      throw error;
+    }
   }
 
   async runImplementReviewLoop(id: string, automaticFixes = true): Promise<void> {
     let item = this.get(id);
-    let failureStage: PipelineStage = "implement";
     if (!item || !["implementing", "fixing"].includes(item.status) || !item.worktreePath || !item.baseSha || !item.planText) throw new Error("Pipeline is not ready to implement");
     const project = this.db.prepare("SELECT path FROM projects WHERE id=?").get(item.projectId) as { path: string } | undefined;
     if (!project) throw new Error("Project not found");
@@ -104,7 +125,6 @@ export class QueueService {
     try {
       while (true) {
         item = this.get(id)!;
-        failureStage = "implement";
         const isFix = item.status === "fixing";
         this.db.prepare("UPDATE queued_prompts SET status=? WHERE id=?").run(isFix ? "fixing" : "implementing", id);
         this.progress(item, isFix ? "fixing" : "implementing");
@@ -119,7 +139,6 @@ export class QueueService {
         this.logEvent(item, "implement", "completed", dirty ? "Implementation changes committed to the pipeline branch." : "Implementation completed without uncommitted changes.");
 
         this.db.prepare("UPDATE queued_prompts SET status='reviewing' WHERE id=?").run(id);
-        failureStage = "review";
         this.progress(item, "reviewing"); this.logEvent(item, "review", "started", `Reviewing with ${item.reviewModel} (${item.reviewEffort}).`);
         // A configurable project test command was considered; v1 gates on a successful Codex exit before independent review.
         const review = await this.runner.review({ worktree: item.worktreePath!, planText: item.planText!, baseRef: item.baseSha!, model: item.reviewModel!, effort: item.reviewEffort! });
@@ -135,7 +154,13 @@ export class QueueService {
         }
         this.exhaust(item); return;
       }
-    } catch (error) { this.fail(item, failureStage, error); } finally { release(); }
+    } catch (error) {
+      // Attribute the failure to whichever stage the row's own status says was in flight
+      // when it threw (set synchronously right before each risky call above), rather than
+      // a separately-tracked flag that a future stage added to this loop could forget to update.
+      const current = this.get(id) ?? item;
+      this.fail(current, current.status === "reviewing" ? "review" : "implement", error);
+    } finally { release(); }
   }
 
   requestMoreFixes(id: string, instructions?: string): QueuedPrompt {

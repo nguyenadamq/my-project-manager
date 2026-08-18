@@ -19,4 +19,10 @@ describe("pipeline settings", () => {
     const resolved = settings.resolve(JSON.stringify({ plan: { model: "opus" } }), JSON.stringify({ plan: { effort: "high" }, review: { model: "haiku" } }));
     expect(resolved.plan).toEqual({ model: "opus", effort: "high" }); expect(resolved.implement.model).toBe("gpt-5.5"); expect(resolved.review.model).toBe("haiku");
   });
+  it("rejects an explicit empty model or effort instead of silently accepting it", () => {
+    expect(() => settings.setGlobalDefaults({ plan: { model: "" } })).toThrow(/cannot be empty/);
+    expect(() => settings.validate({ review: { effort: "" } })).toThrow(/cannot be empty/);
+    // A field that is simply absent (not provided at all) is still a valid "inherit" signal.
+    expect(() => settings.validate({ plan: {} })).not.toThrow();
+  });
 });

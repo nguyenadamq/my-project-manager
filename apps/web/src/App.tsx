@@ -37,7 +37,7 @@ function ProjectDetail({ id, close }: { id: string; close: () => void }) {
     event.preventDefault(); if (!prompt.trim()) return;
     try { await api.addPrompt(id, prompt, useOverrides ? overrides : undefined); setPrompt(""); setOverrides({}); setUseOverrides(false); load(); } catch (cause) { setError((cause as Error).message); }
   };
-  const setOverride = (stage: PipelineStage, field: "model" | "effort", value: string) => setOverrides((current) => ({ ...current, [stage]: { ...current[stage], [field]: value } }));
+  const setOverride = (stage: PipelineStage, field: "model" | "effort", value: string) => setOverrides((current) => ({ ...current, [stage]: { ...current[stage], [field]: value || undefined } }));
   if (!project) return <main><button className="back" onClick={close}>← Projects</button><p>{error || "Loading project…"}</p></main>;
   return <main className="detail">
     <button className="back" onClick={close}>← Projects</button>
