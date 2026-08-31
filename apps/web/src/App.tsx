@@ -9,8 +9,15 @@ const stages: PipelineStage[] = ["plan", "implement", "review"];
 const relative = (value: string | null | undefined) => value ? new Intl.RelativeTimeFormat("en", { numeric: "auto" }).format(Math.round((Date.parse(value) - Date.now()) / 60_000), "minute") : "never";
 
 function Meter({ label, gauge, tone }: { label: string; gauge: UsageGauge; tone: string }) {
-  const sourceLabel = gauge.source === "live" ? "live" : gauge.source === "estimated" ? "estimate" : "not connected";
-  return <article className="meter-card"><div className="meter-head"><span>{label}</span><strong>{gauge.percent}%</strong></div><div className="meter-track"><div style={{ width: `${gauge.percent}%`, background: tone }}/></div><small>{sourceLabel}{gauge.resetAt && ` · resets ${relative(gauge.resetAt)}`}</small></article>;
+  const sourceLabel = gauge.source === "live" ? "live" : gauge.source === "estimated" ? "local estimate — not the real number" : "not connected";
+  return <article className="meter-card">
+    <div className="meter-head"><span>{label}</span><strong>{gauge.source === "unknown" ? "—" : `${gauge.percent}%`}</strong></div>
+    <div className="meter-track"><div style={{ width: `${gauge.percent}%`, background: tone }}/></div>
+    <small className={gauge.source === "live" ? "" : "muted"}>{sourceLabel}{gauge.resetAt && ` · resets ${relative(gauge.resetAt)}`}</small>
+    {/* Why this gauge isn't live. Without it, a "Check usage now" that failed to reach Chrome
+        looks exactly like one that succeeded -- the gauge just keeps showing the local estimate. */}
+    {gauge.detail && <small className="meter-detail" title={gauge.detail}>{gauge.detail}</small>}
+  </article>;
 }
 
 function ProjectDetail({ id, close }: { id: string; close: () => void }) {

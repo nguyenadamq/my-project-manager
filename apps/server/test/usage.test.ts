@@ -39,7 +39,7 @@ describe("UsageService.snapshot", () => {
     const snapshot = await usage.snapshot(new Date());
     expect(snapshot.claudeWeekly).toMatchObject({ source: "unknown", percent: 0 });
     expect(snapshot.codexFiveHour).toMatchObject({ source: "unknown", percent: 0 });
-    expect(snapshot.recommendation).toMatch(/not connected|usage-login/);
+    expect(snapshot.recommendation).toMatch(/isn't connected yet/);
   });
 
   it("prefers a fresh live reading over the estimate/unknown fallback", async () => {
@@ -62,6 +62,34 @@ describe("UsageService.snapshot", () => {
     db.prepare("INSERT INTO live_usage(pool,percent_used,resets_at,checked_at,error) VALUES('claude_weekly',0,NULL,?,'not logged in')").run(now.toISOString());
     const snapshot = await usage.snapshot(now);
     expect(snapshot.claudeWeekly.source).toBe("unknown");
+  });
+
+  // The reported symptom these exist for: "Check usage now" appeared to do nothing. A scrape
+  // that couldn't reach Chrome recorded its error, the snapshot then dropped that error, and the
+  // gauge quietly kept showing the local estimate -- indistinguishable from a successful check.
+  it("explains why a pool fell back rather than silently showing the estimate", async () => {
+    const now = new Date();
+    db.prepare("INSERT INTO live_usage(pool,percent_used,resets_at,checked_at,error) VALUES('claude_session',0,NULL,?,?)")
+      .run(now.toISOString(), "Couldn't reach Chrome at http://127.0.0.1:9222");
+    const snapshot = await usage.snapshot(now);
+    expect(snapshot.claudeSession.source).not.toBe("live");
+    expect(snapshot.claudeSession.detail).toContain("Couldn't reach Chrome");
+  });
+
+  it("says so when the only reading on hand is too old to trust", async () => {
+    const now = new Date();
+    const stale = new Date(now.getTime() - config.usageScrapeIntervalMs * 3);
+    db.prepare("INSERT INTO live_usage(pool,percent_used,resets_at,checked_at,error) VALUES('claude_weekly',42,NULL,?,NULL)").run(stale.toISOString());
+    const snapshot = await usage.snapshot(now);
+    expect(snapshot.claudeWeekly.source).toBe("unknown");
+    expect(snapshot.claudeWeekly.detail).toMatch(/minutes old/);
+  });
+
+  it("leaves detail null when the reading is genuinely live", async () => {
+    const now = new Date();
+    db.prepare("INSERT INTO live_usage(pool,percent_used,resets_at,checked_at,error) VALUES('claude_session',42,NULL,?,NULL)").run(now.toISOString());
+    const snapshot = await usage.snapshot(now);
+    expect(snapshot.claudeSession).toMatchObject({ source: "live", percent: 42, detail: null });
   });
 
   it("estimates codex weekly from the manual log tally as a last resort", async () => {

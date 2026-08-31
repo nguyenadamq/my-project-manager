@@ -43,7 +43,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     codexCliPath: env.PM_CODEX_CLI_PATH?.trim() || "codex",
     usageScrapeEnabled: (env.PM_USAGE_SCRAPE_ENABLED ?? "true").trim().toLowerCase() !== "false",
     usageScrapeIntervalMs: Math.max(60_000, Number(env.PM_USAGE_SCRAPE_INTERVAL_MS ?? 10 * 60_000)),
-    // Attaches over CDP to a dedicated Chrome profile launched by scripts/launch-chrome-debug.ps1
+    // Attaches over CDP to a dedicated Chrome profile launched by scripts/launch-chrome-debug.mjs
     // (Chrome refuses to open a debugging port on the default profile at all, so this can't be
     // the user's everyday browser). The login into that profile happens through a plain,
     // non-automated Chrome window the launch script opens -- automation only ever reads pages

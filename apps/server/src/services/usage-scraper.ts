@@ -91,7 +91,7 @@ export interface UsageScraperOptions {
   enabled: boolean;
   intervalMs: number;
   // http://host:port of an already-running Chrome's --remote-debugging-port (see
-  // scripts/launch-chrome-debug.ps1). Deliberately NOT a separate automated profile that logs
+  // scripts/launch-chrome-debug.mjs). Deliberately NOT a separate automated profile that logs
   // itself in: a fresh, cookie-less, CDP-flagged login attempt is exactly what triggers
   // anti-bot defenses on both claude.ai and chatgpt.com (both sit behind Cloudflare). Attaching
   // to the user's real, already-authenticated Chrome means there is no automated login step at
@@ -151,7 +151,7 @@ export class UsageScraper {
       try {
         browser = await chromium.connectOverCDP(this.options.cdpUrl, { timeout: 10_000 });
       } catch (error) {
-        const message = `Couldn't reach Chrome at ${this.options.cdpUrl}: ${error instanceof Error ? error.message : String(error)}. Launch Chrome with remote debugging enabled (scripts/launch-chrome-debug.ps1 -- see README's "Live usage tracking" section) and stay signed into claude.ai/chatgpt.com there.`;
+        const message = `Couldn't reach Chrome at ${this.options.cdpUrl}: ${error instanceof Error ? error.message : String(error)}. Run 'pnpm usage:chrome' to launch the dedicated debugging Chrome, sign into claude.ai and chatgpt.com in it once, and leave that window open (see README's "Live usage tracking" section).`;
         for (const pool of ALL_POOLS) this.record(pool, null, message);
         return;
       }

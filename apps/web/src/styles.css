@@ -18,3 +18,5 @@
 .picker label{display:grid;gap:6px;font-size:.75rem;font-weight:800}
 .picker label input{padding:9px;border:1px solid #c8cec7;border-radius:7px;background:#fff}
 .picker button:disabled{opacity:.5;cursor:not-allowed}
+.meter-detail{display:block;margin-top:6px;color:#873d2b;background:#fee0d6;border-radius:7px;padding:6px 8px;font-size:.68rem;font-weight:600;line-height:1.35;max-height:4.6em;overflow:hidden}
+.meter-card small.muted{color:#89938e}

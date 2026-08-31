@@ -106,6 +106,11 @@ export interface UsageGauge {
   resetAt: string | null;
   source: UsageSource;
   checkedAt: string | null;
+  // Why this gauge is not showing a live reading: the scraper's own error for this pool, or a
+  // staleness note. Null when the reading is live, or when live tracking has simply never been
+  // attempted. Without this a failed "Check usage now" is indistinguishable from a successful
+  // one -- the gauge just keeps quietly showing the local estimate.
+  detail: string | null;
 }
 
 export interface UsageSnapshot {

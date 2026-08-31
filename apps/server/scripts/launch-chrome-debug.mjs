@@ -42,14 +42,36 @@ if (!chrome) {
   process.exit(1);
 }
 
+const usagePages = ["https://claude.ai/settings/usage", "https://chatgpt.com/codex/cloud/settings/analytics#usage"];
 const firstRun = !fs.existsSync(profileDir);
-const args = [`--remote-debugging-port=${port}`, `--user-data-dir=${profileDir}`, "--no-first-run", "--no-default-browser-check"];
-if (firstRun) args.push("https://claude.ai/settings/usage", "https://chatgpt.com/codex/cloud/settings/analytics#usage");
 
-console.log(`Launching ${chrome} with remote debugging on port ${port}`);
+// If the debug port already answers, this profile's Chrome is running: launching a second copy
+// against the same user-data-dir would just hand the URLs to the existing window anyway, so say
+// so plainly rather than implying a new window appeared.
+const alreadyUp = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(2000) })
+  .then((response) => response.ok)
+  .catch(() => false);
+
+// The usage pages are opened on EVERY launch, not just the first. An existing profile directory
+// does not prove you are signed in -- the directory is created the moment Chrome starts, so a
+// run that was closed before signing in leaves one behind that looks identical to a working
+// one. Opening the pages every time makes the actual state visible: either they render your
+// usage, or they show a login screen and you sign in right there.
+const args = [`--remote-debugging-port=${port}`, `--user-data-dir=${profileDir}`, "--no-first-run", "--no-default-browser-check", ...usagePages];
+
+console.log(alreadyUp
+  ? `Chrome is already listening on port ${port}; opening the usage pages in it.`
+  : `Launching ${chrome} with remote debugging on port ${port}`);
 console.log(`  profile: ${profileDir}${firstRun ? " (new -- you will need to sign in)" : ""}`);
 // Detached and unref'd so Chrome outlives this command instead of dying with the pnpm process.
 spawn(chrome, args, { detached: true, stdio: "ignore" }).unref();
-console.log(firstRun
-  ? "First run: sign into both accounts in the window that just opened, then leave it running."
-  : "Done. Leave that window running -- Project Manager reads its usage pages on an interval.");
+
+console.log("");
+console.log("Two tabs should now be open. In each one:");
+console.log("  1. claude.ai/settings/usage      -- you should see 'Current session' with a % used");
+console.log("  2. chatgpt.com/codex ... #usage  -- you should see '5 hour usage limit' with a % remaining");
+console.log("If either shows a login screen instead, sign in there now (this is an ordinary browser");
+console.log("window -- nothing is automating it). Then LEAVE THIS WINDOW OPEN.");
+console.log("");
+console.log(`Verify it is readable:  curl http://127.0.0.1:${port}/json/version`);
+console.log("Then press \"Check usage now\" in Project Manager, or wait for the next interval check.");
