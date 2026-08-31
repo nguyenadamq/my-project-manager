@@ -5,11 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { EventHub } from "../src/events.js";
+import { migrationSql } from "./helpers/migrations.js";
 import type { ImplementInput, PipelineRunner, PlanInput, ReviewInput, ReviewResult } from "../src/services/pipeline-runner.js";
 import { QueueService } from "../src/services/queue.js";
 import { SettingsService } from "../src/services/settings.js";
 
-const migrations = ["001_initial.sql", "002_pipeline.sql"].map((file) => fs.readFileSync(path.resolve("migrations", file), "utf8"));
+const migrations = migrationSql();
 
 class FakeRunner implements PipelineRunner {
   planCalls = 0; implementCalls = 0; reviewCalls = 0;
@@ -135,5 +136,99 @@ describe("prompt queue pipeline", () => {
     const item = queue.add("p", "Build feature"); expect(() => queue.editPlan(item.id, "new")).toThrow("awaiting approval");
     await queue.runPlanStage(item.id); expect(queue.editPlan(item.id, "Human-edited plan").planText).toBe("Human-edited plan");
     await queue.approvePlan(item.id); expect(() => queue.editPlan(item.id, "too late")).toThrow("awaiting approval"); expect(() => queue.update(item.id, { text: "too late" })).toThrow("active pipeline");
+  });
+
+  describe("retryFailed", () => {
+    it("rejects retrying anything but a failed item", async () => {
+      const item = queue.add("p", "Build feature");
+      await expect(queue.retryFailed(item.id)).rejects.toThrow("Only a failed item");
+    });
+
+    it("sends a plan-stage failure (no worktree yet) back to queued, ready for a normal push", async () => {
+      runner.failAt = "plan";
+      const item = queue.add("p", "Build feature"); await queue.runPlanStage(item.id);
+      expect(queue.list("p")[0]).toMatchObject({ status: "failed", worktreePath: null });
+      const retried = await queue.retryFailed(item.id);
+      expect(retried).toMatchObject({ status: "queued", needsAttention: false, errorMessage: null });
+      runner.failAt = null; await queue.runPlanStage(item.id);
+      expect(queue.list("p")[0]!.status).toBe("plan_ready"); // proves it actually runs again, not just reset
+    });
+
+    it("resumes a first-attempt implement failure as a fresh pass -- no prior commit exists to continue from", async () => {
+      const item = queue.add("p", "Build feature"); await queue.runPlanStage(item.id); const approved = await queue.approvePlan(item.id);
+      runner.failAt = "implement"; await queue.runImplementReviewLoop(item.id);
+      expect(queue.list("p")[0]).toMatchObject({ status: "failed", worktreePath: approved.worktreePath });
+      const retried = await queue.retryFailed(item.id);
+      expect(retried).toMatchObject({ status: "implementing", worktreePath: approved.worktreePath, planApprovedAt: approved.planApprovedAt }); // same worktree/plan, not re-planned
+      runner.failAt = null; await queue.runImplementReviewLoop(retried.id);
+      expect(queue.list("p")[0]).toMatchObject({ status: "done", reviewVerdict: "CLEAN" });
+      expect(runner.planCalls).toBe(1); // plan never re-ran on retry
+    });
+
+    // The bug this guards against: naively always resuming as 'implementing' would fire a
+    // brand-new `codex exec` at a worktree that already has a successful, committed implement
+    // pass sitting in it (from before the fix round that then failed) -- duplicating or
+    // conflicting with real work instead of continuing the same Codex session.
+    it("resumes a fix-round failure as 'fixing' (continuing the session), not a fresh 'implementing' pass", async () => {
+      const item = queue.add("p", "Build feature"); await queue.runPlanStage(item.id); const approved = await queue.approvePlan(item.id);
+      runner.reviews = [{ verdict: "NEEDS-FIXES", notes: "needs work" }];
+      const originalImplement = runner.implement.bind(runner);
+      runner.implement = async (input) => {
+        if (runner.implementCalls === 1) { runner.implementCalls++; throw new Error("fix round exploded"); }
+        return originalImplement(input);
+      };
+      await queue.runImplementReviewLoop(item.id);
+      expect(queue.list("p")[0]).toMatchObject({ status: "failed", fixRoundsUsed: 1 });
+      // A real commit from the successful first implement pass already exists in the worktree.
+      expect(execFileSync("git", ["-C", approved.worktreePath!, "rev-list", "--count", `${approved.baseSha}..HEAD`], { encoding: "utf8" }).trim()).toBe("1");
+      const retried = await queue.retryFailed(item.id);
+      expect(retried.status).toBe("fixing"); // not "implementing"
+      runner.implement = originalImplement; runner.reviews = [{ verdict: "CLEAN", notes: "fixed" }];
+      await queue.runImplementReviewLoop(retried.id);
+      expect(queue.list("p")[0]).toMatchObject({ status: "done", reviewVerdict: "CLEAN" });
+    });
+
+    it("clears needsAttention and the stale error message on retry", async () => {
+      runner.failAt = "plan";
+      const item = queue.add("p", "Build feature"); await queue.runPlanStage(item.id);
+      expect(queue.list("p")[0]).toMatchObject({ needsAttention: true, errorMessage: "plan exploded" });
+      expect(await queue.retryFailed(item.id)).toMatchObject({ needsAttention: false, errorMessage: null });
+    });
+  });
+
+  describe("implement-only mode", () => {
+    it("rejects an unrecognized mode", () => {
+      expect(() => queue.add("p", "Build feature", undefined, "bogus" as never)).toThrow("Invalid pipeline mode");
+    });
+
+    it("skips planning and review entirely, going straight from queued to done", async () => {
+      const item = queue.add("p", "Build feature", undefined, "implement_only");
+      expect(item.mode).toBe("implement_only");
+      await queue.runPlanStage(item.id);
+      const done = queue.list("p")[0]!;
+      expect(done).toMatchObject({ status: "done", needsAttention: false, planText: "Build feature", reviewVerdict: null });
+      expect(done.resultBranch).toBe(`pm/${item.id}`);
+      expect(fs.existsSync(done.worktreePath!)).toBe(true);
+      expect(runner.planCalls).toBe(0); expect(runner.reviewCalls).toBe(0); expect(runner.implementCalls).toBe(1);
+      expect(execFileSync("git", ["-C", repo, "rev-parse", "main"], { encoding: "utf8" }).trim()).toBe(mainSha);
+      expect(queue.listEvents(item.id).map((event) => event.kind)).not.toContain("awaiting_approval");
+    });
+
+    it("fails and attributes the error to implement, not plan, on a hard failure", async () => {
+      runner.failAt = "implement";
+      const item = queue.add("p", "Build feature", undefined, "implement_only");
+      await queue.runPlanStage(item.id);
+      const failed = queue.list("p")[0]!;
+      expect(failed).toMatchObject({ status: "failed", needsAttention: true, errorMessage: "implement exploded" });
+      expect(fs.existsSync(failed.worktreePath!)).toBe(true); // preserved for inspection, same as full mode
+      const failedEvent = queue.listEvents(item.id).find((event) => event.kind === "failed");
+      expect(failedEvent?.stage).toBe("implement");
+    });
+
+    it("never reaches plan_ready, so approve/edit-plan reject it", async () => {
+      const item = queue.add("p", "Build feature", undefined, "implement_only");
+      await expect(queue.approvePlan(item.id)).rejects.toThrow("completed plan");
+      expect(() => queue.editPlan(item.id, "x")).toThrow("awaiting approval");
+    });
   });
 });

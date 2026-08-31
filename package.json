@@ -3,10 +3,13 @@
   "private": true,
   "packageManager": "pnpm@11.19.0",
   "scripts": {
+    "bootstrap": "node scripts/bootstrap.mjs",
     "dev": "pnpm --parallel --filter @pm/server --filter @pm/web dev",
     "build": "pnpm -r build",
+    "start": "pnpm build && pnpm --filter @pm/server start",
     "typecheck": "pnpm --filter @pm/shared build && pnpm --filter @pm/server typecheck && pnpm --filter @pm/web typecheck",
     "test": "pnpm --filter @pm/shared build && pnpm --filter @pm/server test && pnpm --filter @pm/web test",
-    "lint": "pnpm --filter @pm/shared build && pnpm --filter @pm/server lint && pnpm --filter @pm/web lint"
+    "lint": "pnpm --filter @pm/shared build && pnpm --filter @pm/server lint && pnpm --filter @pm/web lint",
+    "usage:chrome": "pnpm --filter @pm/server usage:chrome"
   }
 }

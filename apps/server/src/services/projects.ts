@@ -13,13 +13,21 @@ const mapProject = (row: any): Project => ({
   overallSummaryMd: row.overall_summary_md ?? undefined, latestFeatureMd: row.latest_feature_md ?? undefined,
   pipelineOverrides: row.pipeline_overrides ? JSON.parse(row.pipeline_overrides) : null,
   needsAttentionCount: Number(row.needs_attention_count ?? 0),
+  priority: Number(row.priority ?? 0),
 });
 
 export class ProjectService {
   constructor(private db: Db, private config: Config) {}
 
   list(): Project[] {
-    return (this.db.prepare(`SELECT p.*, s.overall_summary_md, s.latest_feature_md,(SELECT COUNT(*) FROM queued_prompts q WHERE q.project_id=p.id AND q.needs_attention=1) needs_attention_count FROM projects p LEFT JOIN feature_summaries s ON s.project_id=p.id ORDER BY p.added_at DESC`).all() as any[]).map(mapProject);
+    const projects = (this.db.prepare(`SELECT p.*, s.overall_summary_md, s.latest_feature_md,(SELECT COUNT(*) FROM queued_prompts q WHERE q.project_id=p.id AND q.needs_attention=1) needs_attention_count FROM projects p LEFT JOIN feature_summaries s ON s.project_id=p.id ORDER BY p.priority DESC, p.added_at DESC`).all() as any[]).map(mapProject);
+    // Attaching each project's queue here (not just in get()) is what lets the dashboard show
+    // "what's actually sitting in the queue and why isn't it moving" without opening every
+    // project one at a time -- an N+1 query, but for a personal tool with a handful of
+    // projects that's simpler and fine, and mirrors get()'s own query exactly.
+    const queueByProject = this.db.prepare(`${selectQueue} WHERE project_id=? ORDER BY position,created_at`);
+    for (const project of projects) project.queue = (queueByProject.all(project.id) as Record<string, unknown>[]).map((row) => mapPrompt(row)!);
+    return projects;
   }
 
   get(id: string): Project | null {
@@ -49,6 +57,15 @@ export class ProjectService {
   setPipelineOverrides(id: string, overrides: PipelineOverrides | null): Project {
     if (!this.get(id)) throw new Error("Project not found");
     this.db.prepare("UPDATE projects SET pipeline_overrides=? WHERE id=?").run(overrides ? JSON.stringify(overrides) : null, id);
+    return this.get(id)!;
+  }
+  // Higher runs first: breaks ties between projects competing for the same auto-dispatch slot
+  // (see auto-dispatch.ts) and orders the dashboard. Not otherwise bounded -- any integer is
+  // fine, it's only ever compared relatively.
+  setPriority(id: string, priority: number): Project {
+    if (!this.get(id)) throw new Error("Project not found");
+    if (!Number.isInteger(priority)) throw new Error("Priority must be a whole number");
+    this.db.prepare("UPDATE projects SET priority=? WHERE id=?").run(priority, id);
     return this.get(id)!;
   }
 }

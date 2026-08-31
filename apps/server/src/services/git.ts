@@ -6,8 +6,18 @@ import { promisify } from "node:util";
 const exec = promisify(execFile);
 
 export async function git(repo: string, args: string[], maxBuffer = 2_000_000): Promise<string> {
-  const { stdout } = await exec("git", ["-C", repo, ...args], { maxBuffer });
-  return stdout.trim();
+  try {
+    const { stdout } = await exec("git", ["-C", repo, ...args], { maxBuffer });
+    return stdout.trim();
+  } catch (error) {
+    // execFile's rejection carries the actual reason on `.stderr` (git always writes its
+    // "fatal: ..." explanation there), but `.message` alone is just "Command failed: git ...
+    // <args>" with no explanation -- exactly the dead-end error a failed plan/review stage
+    // previously surfaced to the user with no way to tell what actually went wrong.
+    const stderr = (error as { stderr?: string }).stderr?.trim();
+    if (stderr) throw new Error(`git ${args.join(" ")} failed: ${stderr}`);
+    throw error;
+  }
 }
 
 export async function assertGitRepository(repo: string): Promise<void> {

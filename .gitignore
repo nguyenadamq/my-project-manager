@@ -8,3 +8,4 @@ coverage/
 *.tsbuildinfo
 .pm/
 apps/web/dev-dist/
+data/

@@ -1,14 +1,7 @@
-import type { PipelineDefaults, PipelineOverrides, PipelineStage } from "@pm/shared";
+import { DEFAULT_PIPELINE, PIPELINE_EFFORTS, PIPELINE_MODELS, type PipelineDefaults, type PipelineOverrides, type PipelineStage } from "@pm/shared";
 import type { Db } from "../db.js";
 
-export const DEFAULT_PIPELINE: PipelineDefaults = {
-  plan: { model: "sonnet", effort: "high" },
-  implement: { model: "gpt-5.6-sol", effort: "medium" },
-  review: { model: "sonnet", effort: "medium" },
-};
-
-export const PIPELINE_MODELS = ["sonnet", "opus", "haiku", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4"];
-export const PIPELINE_EFFORTS = ["low", "medium", "high", "xhigh", "max", "ultra"];
+export { DEFAULT_PIPELINE, PIPELINE_MODELS, PIPELINE_EFFORTS };
 const stages: PipelineStage[] = ["plan", "implement", "review"];
 
 function parse(value: string | null | undefined): PipelineOverrides {

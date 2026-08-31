@@ -3,8 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import { DEFAULT_PIPELINE, SettingsService } from "../src/services/settings.js";
+import { migrationSql } from "./helpers/migrations.js";
 
-const migrations = ["001_initial.sql", "002_pipeline.sql"].map((file) => fs.readFileSync(path.resolve("migrations", file), "utf8"));
+const migrations = migrationSql();
 let db: DatabaseSync; let settings: SettingsService;
 beforeEach(() => { db = new DatabaseSync(":memory:"); for (const migration of migrations) db.exec(migration); settings = new SettingsService(db); });
 
