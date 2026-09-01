@@ -31,16 +31,37 @@ export async function getRepoMetadata(repo: string) {
   return { sha, root: path.resolve(root), remote };
 }
 
+// Git worktrees (including the isolated `.pm/worktrees/<jobId>` ones a pipeline run creates)
+// share their main repo's hooks -- there is no per-worktree hooks directory -- so this hook
+// fires on the "pm: implement"/"pm: fix round" commits queue.ts makes too, not just on ordinary
+// commits to the project's own primary checkout. An earlier version had no guard against that:
+// `git rev-parse --show-toplevel` inside a linked worktree resolves to the *worktree's own*
+// root, so the hook happily wrote `<worktree>/.pm/trigger` there, and the pipeline's own
+// `git add -A` on its *next* commit (a fix round) swept that leftover file into the generated
+// branch -- caught live by an independent review flagging it as unplanned scope creep, the same
+// class of bug fixed for `.codex-last-message.txt` above. `.git` is a directory in a repo's
+// primary checkout and a `gitdir: ...` pointer *file* in a linked worktree, so checking that
+// distinguishes the two without embedding this repo's own path (and its escaping/format hazards
+// across OSes) into the hook script at all.
+const TRIGGER_MARKER = "# my-project-manager-trigger";
+const OLD_TRIGGER_BODY = `${TRIGGER_MARKER}\nmkdir -p \"$(git rev-parse --show-toplevel)/.pm\"\ngit rev-parse HEAD > \"$(git rev-parse --show-toplevel)/.pm/trigger\"\n`;
+const TRIGGER_BODY = `${TRIGGER_MARKER}\ntoplevel=\"$(git rev-parse --show-toplevel)\"\nif [ -d \"$toplevel/.git\" ]; then\n  mkdir -p \"$toplevel/.pm\"\n  git rev-parse HEAD > \"$toplevel/.pm/trigger\"\nfi\n`;
+
 export async function installPostCommitHook(repo: string): Promise<void> {
   const gitDir = await git(repo, ["rev-parse", "--git-dir"]);
   const hookPath = path.resolve(repo, gitDir, "hooks", "post-commit");
-  const marker = "# my-project-manager-trigger";
   let existing = "#!/bin/sh\n";
   try { existing = await fs.readFile(hookPath, "utf8"); } catch { /* new hook */ }
-  if (!existing.includes(marker)) {
-    const line = `${marker}\nmkdir -p \"$(git rev-parse --show-toplevel)/.pm\"\ngit rev-parse HEAD > \"$(git rev-parse --show-toplevel)/.pm/trigger\"\n`;
+  let updated: string | null = null;
+  if (existing.includes(OLD_TRIGGER_BODY)) {
+    // Repair a hook installed by an older version of this app on an already-registered project.
+    updated = existing.replace(OLD_TRIGGER_BODY, TRIGGER_BODY);
+  } else if (!existing.includes(TRIGGER_MARKER)) {
+    updated = `${existing.trimEnd()}\n${TRIGGER_BODY}`;
+  }
+  if (updated !== null) {
     await fs.mkdir(path.dirname(hookPath), { recursive: true });
-    await fs.writeFile(hookPath, `${existing.trimEnd()}\n${line}`, { mode: 0o755 });
+    await fs.writeFile(hookPath, updated, { mode: 0o755 });
   }
   await fs.mkdir(path.join(repo, ".pm"), { recursive: true });
 }

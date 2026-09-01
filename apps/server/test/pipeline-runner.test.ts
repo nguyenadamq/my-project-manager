@@ -22,9 +22,12 @@ describe("pipeline CLI", () => {
     expect(buildPlanArgs("sonnet", "high")).toEqual(["-p", "-", "--model", "sonnet", "--effort", "high", "--permission-mode", "plan"]);
   });
   it("builds first-run and resume Codex arguments, reading plan/feedback text from stdin", () => {
-    const worktree = path.join(os.tmpdir(), "worktree"); const output = path.join(worktree, ".codex-last-message.txt");
-    expect(buildImplementArgs({ worktree, model: "gpt-5.6-sol", effort: "medium" })).toEqual(["exec", "-s", "workspace-write", "-C", worktree, "-c", "model=gpt-5.6-sol", "-c", "model_reasoning_effort=medium", "-o", output, "-"]);
-    expect(buildImplementArgs({ worktree, model: "ignored", effort: "ignored", resume: true })).toEqual(["exec", "resume", "--last", "-C", worktree, "-o", output, "-"]);
+    const worktree = path.join(os.tmpdir(), "worktree"); const output = path.join(os.tmpdir(), "pm-codex-output-test.txt");
+    expect(buildImplementArgs({ worktree, model: "gpt-5.6-sol", effort: "medium" }, output)).toEqual(["exec", "-s", "workspace-write", "-C", worktree, "-c", "model=gpt-5.6-sol", "-c", "model_reasoning_effort=medium", "-o", output, "-"]);
+    // `codex exec resume` has no `-C`/`--cd` flag at all -- it resolves the session to resume by
+    // matching the process's actual cwd (already set by runCli's own `cwd` option), and passing
+    // one anyway is a hard CLI error ("unexpected argument '-C' found").
+    expect(buildImplementArgs({ worktree, model: "ignored", effort: "ignored", resume: true }, output)).toEqual(["exec", "resume", "--last", "-o", output, "-"]);
   });
   it("builds the independent Claude review arguments, reading the prompt from stdin", () => expect(buildReviewArgs("sonnet", "medium")).toEqual(["-p", "-", "--model", "sonnet", "--effort", "medium", "--permission-mode", "plan"]));
   it("pipes the prompt through stdin instead of a CLI argument", async () => {
