@@ -7,8 +7,7 @@ import path from "node:path";
 // summary-synthesis feature (see summaries.ts) -- stripping these before every spawn
 // keeps that key from leaking into the child and silently switching Claude Code (or
 // Codex, for the OpenAI-side equivalents) from subscription auth to pay-per-token API
-// billing. Same isolation this workspace's other CLI-driven AI worker uses for the
-// same reason (mass-job-monitor's subscription_environment()).
+// billing.
 const CREDENTIAL_ENV_VARS = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL", "OPENAI_API_KEY", "OPENAI_BASE_URL", "AZURE_OPENAI_API_KEY"];
 
 function subscriptionEnv(): NodeJS.ProcessEnv {
