@@ -27,6 +27,7 @@ export const api = {
   patchPrompt: (id: string, patch: object) => request<QueuedPrompt>(`/api/queue/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
   pushPrompt: (id: string) => request(`/api/queue/${id}/push`, { method: "POST" }),
   editPlan: (id: string, text: string) => request<QueuedPrompt>(`/api/queue/${id}/plan`, { method: "PATCH", body: JSON.stringify({ text }) }),
+  editReviewPrompt: (id: string, text: string) => request<QueuedPrompt>(`/api/queue/${id}/review-prompt`, { method: "PATCH", body: JSON.stringify({ text }) }),
   approvePlan: (id: string) => request(`/api/queue/${id}/approve-plan`, { method: "POST" }),
   retryFailed: (id: string) => request(`/api/queue/${id}/retry`, { method: "POST" }),
   requestFixes: (id: string, instructions?: string) => request(`/api/queue/${id}/request-fixes`, { method: "POST", body: JSON.stringify({ instructions }) }),

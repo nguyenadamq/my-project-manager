@@ -16,13 +16,14 @@ class FakeRunner implements PipelineRunner {
   planCalls = 0; implementCalls = 0; reviewCalls = 0;
   reviews: ReviewResult[] = [{ verdict: "CLEAN", notes: "Everything matches." }];
   failAt: "plan" | "implement" | "review" | null = null;
-  async plan(_input: PlanInput) { this.planCalls++; if (this.failAt === "plan") throw new Error("plan exploded"); return "# Approved approach\nBuild it safely."; }
+  async plan(_input: PlanInput) { this.planCalls++; if (this.failAt === "plan") throw new Error("plan exploded"); return { text: "# Approved approach\nBuild it safely.", reviewPrompt: "Check it was built safely." }; }
   async implement(input: ImplementInput) {
     this.implementCalls++; if (this.failAt === "implement") throw new Error("implement exploded");
     fs.writeFileSync(path.join(input.worktree, `attempt-${this.implementCalls}.txt`), `attempt ${this.implementCalls}\n`);
     return `Implementation attempt ${this.implementCalls}`;
   }
-  async review(_input: ReviewInput) { this.reviewCalls++; if (this.failAt === "review") throw new Error("review exploded"); return this.reviews[Math.min(this.reviewCalls - 1, this.reviews.length - 1)]!; }
+  lastReviewInput: ReviewInput | null = null;
+  async review(input: ReviewInput) { this.reviewCalls++; this.lastReviewInput = input; if (this.failAt === "review") throw new Error("review exploded"); return this.reviews[Math.min(this.reviewCalls - 1, this.reviews.length - 1)]!; }
 }
 
 let db: DatabaseSync; let queue: QueueService; let runner: FakeRunner; let root: string; let repo: string; let mainSha: string;
@@ -61,6 +62,15 @@ describe("prompt queue pipeline", () => {
     const item = queue.add("p", "Build feature"); await expect(queue.approvePlan(item.id)).rejects.toThrow("completed plan");
     await queue.runPlanStage(item.id); const approved = await queue.approvePlan(item.id);
     expect(approved.status).toBe("implementing"); expect(fs.existsSync(approved.worktreePath!)).toBe(true); expect(approved.resultBranch).toBe(`pm/${item.id}`);
+  });
+
+  it("drafts a review prompt alongside the plan and passes it to the review stage", async () => {
+    const item = queue.add("p", "Build feature"); await queue.runPlanStage(item.id);
+    const planReady = queue.list("p")[0]!;
+    expect(planReady.reviewPrompt).toBe("Check it was built safely.");
+    expect(planReady.reviewPromptOriginalText).toBe("Check it was built safely.");
+    await queue.approvePlan(item.id); await queue.runImplementReviewLoop(item.id);
+    expect(runner.lastReviewInput?.reviewPrompt).toBe("Check it was built safely.");
   });
 
   it("rejects a duplicate concurrent approval with a clear message instead of racing git", async () => {

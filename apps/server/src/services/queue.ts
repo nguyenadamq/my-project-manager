@@ -7,7 +7,7 @@ import type { PipelineRunner } from "./pipeline-runner.js";
 import type { SettingsService } from "./settings.js";
 
 const activeStatuses: QueueStatus[] = ["planning", "implementing", "reviewing", "fixing"];
-export const selectQueue = `SELECT id,project_id projectId,text,position,status,mode,dispatch,created_at createdAt,started_at startedAt,finished_at finishedAt,result_branch resultBranch,result_diff_summary resultDiffSummary,error_message errorMessage,needs_attention needsAttention,worktree_path worktreePath,base_sha baseSha,plan_text planText,plan_original_text planOriginalText,plan_approved_at planApprovedAt,fix_rounds_used fixRoundsUsed,review_verdict reviewVerdict,review_notes reviewNotes,run_overrides runOverrides,plan_model planModel,plan_effort planEffort,implement_model implementModel,implement_effort implementEffort,review_model reviewModel,review_effort reviewEffort FROM queued_prompts`;
+export const selectQueue = `SELECT id,project_id projectId,text,position,status,mode,dispatch,created_at createdAt,started_at startedAt,finished_at finishedAt,result_branch resultBranch,result_diff_summary resultDiffSummary,error_message errorMessage,needs_attention needsAttention,worktree_path worktreePath,base_sha baseSha,plan_text planText,plan_original_text planOriginalText,review_prompt reviewPrompt,review_prompt_original_text reviewPromptOriginalText,plan_approved_at planApprovedAt,fix_rounds_used fixRoundsUsed,review_verdict reviewVerdict,review_notes reviewNotes,run_overrides runOverrides,plan_model planModel,plan_effort planEffort,implement_model implementModel,implement_effort implementEffort,review_model reviewModel,review_effort reviewEffort FROM queued_prompts`;
 
 export function mapPrompt(row: Record<string, unknown> | undefined): QueuedPrompt | null {
   if (!row) return null;
@@ -74,6 +74,15 @@ export class QueueService {
     return this.get(id)!;
   }
 
+  editReviewPrompt(id: string, text: string) {
+    const item = this.get(id); if (!item || item.status !== "plan_ready") throw new Error("Review instructions can only be edited while awaiting approval");
+    if (!text.trim()) throw new Error("Review instructions are required");
+    this.db.prepare("UPDATE queued_prompts SET review_prompt=? WHERE id=?").run(text.trim(), id);
+    this.logEvent(item, "plan", "output", "The user edited the review instructions.");
+    this.events.emit({ type: "queue.updated", projectId: item.projectId });
+    return this.get(id)!;
+  }
+
   async runPlanStage(id: string): Promise<void> {
     const item = this.get(id); if (!item || item.status !== "queued") throw new Error("Queued prompt not found");
     if (this.starting.has(id)) return; // already kicked off and waiting for a slot
@@ -96,7 +105,7 @@ export class QueueService {
       this.db.prepare("UPDATE queued_prompts SET status='planning',started_at=?,needs_attention=0,error_message=NULL WHERE id=?").run(new Date().toISOString(), id);
       this.progress(current, "planning"); this.logEvent(current, "plan", "started", `Planning with ${config.plan.model} (${config.plan.effort}).`);
       const plan = await this.runner.plan({ repo: project.path, prompt: current.text, ...config.plan });
-      this.db.prepare("UPDATE queued_prompts SET status='plan_ready',plan_text=?,plan_original_text=?,needs_attention=1 WHERE id=?").run(plan, plan, id);
+      this.db.prepare("UPDATE queued_prompts SET status='plan_ready',plan_text=?,plan_original_text=?,review_prompt=?,review_prompt_original_text=?,needs_attention=1 WHERE id=?").run(plan.text, plan.text, plan.reviewPrompt, plan.reviewPrompt, id);
       this.logEvent(current, "plan", "completed", "Draft plan completed.");
       this.logEvent(current, "plan", "awaiting_approval", "Plan is ready for human review and approval.");
       this.progress(current, "plan_ready");
@@ -178,7 +187,7 @@ export class QueueService {
         this.db.prepare("UPDATE queued_prompts SET status='reviewing' WHERE id=?").run(id);
         this.progress(item, "reviewing"); this.logEvent(item, "review", "started", `Reviewing with ${item.reviewModel} (${item.reviewEffort}).`);
         // A configurable project test command was considered; v1 gates on a successful Codex exit before independent review.
-        const review = await this.runner.review({ worktree: item.worktreePath!, planText: item.planText!, baseRef: item.baseSha!, model: item.reviewModel!, effort: item.reviewEffort! });
+        const review = await this.runner.review({ worktree: item.worktreePath!, planText: item.planText!, reviewPrompt: item.reviewPrompt ?? "", baseRef: item.baseSha!, model: item.reviewModel!, effort: item.reviewEffort! });
         this.db.prepare("UPDATE queued_prompts SET review_verdict=?,review_notes=? WHERE id=?").run(review.verdict, review.notes, id);
         this.logEvent(item, "review", "verdict", `${review.verdict}\n${review.notes}`);
         if (review.verdict === "CLEAN") { await this.complete(item, project.path); return; }

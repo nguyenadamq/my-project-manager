@@ -10,7 +10,7 @@ import type { PipelineRunner } from "../src/services/pipeline-runner.js";
 
 let root: string; let repo: string;
 const runner: PipelineRunner = {
-  plan: async () => "# Plan",
+  plan: async () => ({ text: "# Plan", reviewPrompt: "Check it matches the plan." }),
   implement: async () => "implemented",
   review: async () => ({ verdict: "CLEAN", notes: "clean" }),
 };

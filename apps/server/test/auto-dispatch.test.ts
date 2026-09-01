@@ -37,7 +37,7 @@ describe("requiredPoolsOk", () => {
 });
 
 class FakeRunner implements PipelineRunner {
-  async plan(_input: PlanInput) { return "# Plan\nDo it."; }
+  async plan(_input: PlanInput) { return { text: "# Plan\nDo it.", reviewPrompt: "Check it was done." }; }
   async implement(input: ImplementInput) { fs.writeFileSync(path.join(input.worktree, "change.txt"), "done\n"); return "done"; }
   async review(_input: ReviewInput) { return { verdict: "CLEAN" as const, notes: "ok" }; }
 }

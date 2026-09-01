@@ -54,6 +54,11 @@ export interface QueuedPrompt {
   baseSha: string | null;
   planText: string | null;
   planOriginalText: string | null;
+  // Drafted by the same plan-stage call as planText: bespoke, plan-specific criteria the review
+  // stage uses instead of generic instructions. Null for implement_only items (no review stage)
+  // and for plan_ready rows from before this field existed.
+  reviewPrompt: string | null;
+  reviewPromptOriginalText: string | null;
   planApprovedAt: string | null;
   fixRoundsUsed: number;
   reviewVerdict: "CLEAN" | "NEEDS-FIXES" | null;

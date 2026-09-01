@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { quoteWindowsArg, runCli } from "../src/services/cli.js";
-import { buildImplementArgs, buildPlanArgs, buildReviewArgs, extractVerdict } from "../src/services/pipeline-runner.js";
+import { buildImplementArgs, buildPlanArgs, buildReviewArgs, DEFAULT_REVIEW_PROMPT, extractVerdict, splitPlanAndReviewPrompt } from "../src/services/pipeline-runner.js";
 
 describe("pipeline CLI", () => {
   it("closes stdin so a subprocess can exit", async () => {
@@ -67,6 +67,27 @@ describe("quoteWindowsArg", () => {
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("splitPlanAndReviewPrompt", () => {
+  it("splits a well-formed two-section response", () => {
+    const result = splitPlanAndReviewPrompt("## IMPLEMENTATION PLAN\nAdd a NOTES.md file.\n\n## REVIEW INSTRUCTIONS\nCheck NOTES.md is one sentence.\n");
+    expect(result.text).toBe("## IMPLEMENTATION PLAN\nAdd a NOTES.md file.");
+    expect(result.reviewPrompt).toBe("Check NOTES.md is one sentence.");
+  });
+  it("tolerates markdown emphasis and case around the review-instructions heading", () => {
+    expect(splitPlanAndReviewPrompt("Do the thing.\n\n**Review Instructions:**\nCheck the thing.").reviewPrompt).toBe("Check the thing.");
+  });
+  it("splits on the last matching heading, not one mentioned in passing earlier", () => {
+    const result = splitPlanAndReviewPrompt("## IMPLEMENTATION PLAN\nMention review instructions in prose here.\n\n## REVIEW INSTRUCTIONS\nActual criteria.");
+    expect(result.text).toContain("Mention review instructions in prose here.");
+    expect(result.reviewPrompt).toBe("Actual criteria.");
+  });
+  it("falls back to the generic review prompt when the model didn't use the two-section format", () => {
+    const result = splitPlanAndReviewPrompt("Just a plain plan with no sections at all.");
+    expect(result.text).toBe("Just a plain plan with no sections at all.");
+    expect(result.reviewPrompt).toBe(DEFAULT_REVIEW_PROMPT);
   });
 });
 

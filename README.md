@@ -10,7 +10,7 @@ A private, mobile-first command center for local Git repositories. Register proj
 - Debounced, SHA-aware summary refreshes. Anthropic synthesis is used when `ANTHROPIC_API_KEY` is present; a deterministic local summary keeps the app useful offline.
 - Two ways to start any prompt, chosen per prompt: **instant**, which begins the moment you add it, or **queued**, which waits for you to press Start or for auto-dispatch to choose it. Both run the identical pipeline in the identical isolated worktree. For `full`-mode prompts the plan stage -- read-only, and always followed by a separate approval checkpoint before anything is implemented -- starts immediately either way; `queued` only holds back `implement_only` prompts, which have no such checkpoint.
 - FIFO prompt queue with a mandatory approval checkpoint between planning and implementation.
-- Claude creates the plan, Codex implements the approved plan in `.pm/worktrees/<jobId>` on a `pm/<jobId>` branch, and Claude independently reviews the result.
+- Claude creates the plan, Codex implements the approved plan in `.pm/worktrees/<jobId>` on a `pm/<jobId>` branch, and Claude independently reviews the result. The same plan-stage call also drafts bespoke review instructions for that specific change -- what to check, likely failure modes, what counts as scope creep here -- so the review stage works from concrete, plan-specific criteria instead of generic ones re-derived from scratch; both are editable before you approve.
 - Up to two automatic fix rounds after a `NEEDS-FIXES` verdict, followed by a human-attention state and an explicit option to request another round.
 - A `failed` item can be retried in place: resumes from its existing worktree if implement/review is what failed, or starts over cleanly if planning never got that far.
 - Two pipeline modes, chosen per prompt: the supervised `full` Plan → Implement → Review loop above, or `implement_only`, which skips the plan draft/approval checkpoint and the independent review — Codex acts on your prompt directly, still isolated in its own worktree/branch.
@@ -116,6 +116,7 @@ All `/api/*` routes except `/api/health` require `Authorization: Bearer <PM_AUTH
 | PATCH | `/api/queue/:promptId` | Edit, reorder, or cancel a prompt |
 | POST | `/api/queue/:promptId/push` | Start the planning stage |
 | PATCH | `/api/queue/:promptId/plan` | Edit a completed plan before approval |
+| PATCH | `/api/queue/:promptId/review-prompt` | Edit the plan stage's drafted review instructions before approval |
 | POST | `/api/queue/:promptId/approve-plan` | Approve the plan and start implementation |
 | POST | `/api/queue/:promptId/request-fixes` | Request one additional fix/review round |
 | POST | `/api/queue/:promptId/retry` | Retry a `failed` item -- resumes from its worktree if one exists (implement/review failed), otherwise starts over from `queued` (plan failed) |

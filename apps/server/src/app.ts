@@ -115,6 +115,7 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   });
   app.patch<{ Params: { promptId: string }; Body: { text?: string; position?: number; status?: "cancelled" } }>("/api/queue/:promptId", async (request) => queue.update(request.params.promptId, request.body));
   app.patch<{ Params: { promptId: string }; Body: { text: string } }>("/api/queue/:promptId/plan", async (request) => queue.editPlan(request.params.promptId, request.body.text));
+  app.patch<{ Params: { promptId: string }; Body: { text: string } }>("/api/queue/:promptId/review-prompt", async (request) => queue.editReviewPrompt(request.params.promptId, request.body.text));
   app.post<{ Params: { promptId: string } }>("/api/queue/:promptId/push", async (request, reply) => {
     setImmediate(() => schedule(queue.runPlanStage(request.params.promptId)));
     return reply.code(202).send({ accepted: true });

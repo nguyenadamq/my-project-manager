@@ -54,10 +54,12 @@ function Timeline({ item }: { item: QueuedPrompt }) {
 
 export function QueueItem({ item, reload, onError }: { item: QueuedPrompt; reload: () => void; onError: (message: string) => void }) {
   const [plan, setPlan] = useState(item.planText ?? "");
+  const [reviewPrompt, setReviewPrompt] = useState(item.reviewPrompt ?? "");
   const [instructions, setInstructions] = useState("");
   const [expanded, setExpanded] = useState(false);
   const [events, setEvents] = useState<PipelineEvent[]>([]);
   useEffect(() => setPlan(item.planText ?? ""), [item.planText]);
+  useEffect(() => setReviewPrompt(item.reviewPrompt ?? ""), [item.reviewPrompt]);
   useEffect(() => {
     if (expanded) void api.pipelineEvents(item.id).then(setEvents).catch((error) => onError(error.message));
     const listener = (raw: Event) => {
@@ -70,7 +72,17 @@ export function QueueItem({ item, reload, onError }: { item: QueuedPrompt; reloa
   return <article className={`queue-item ${item.needsAttention ? "attention" : ""}`}>
     <header><span className={`status ${item.status}`}>{labels[item.status]}</span>{item.mode === "implement_only" && <span className="mode-badge">Implement only</span>}{item.dispatch === "instant" && <span className="mode-badge instant">Instant</span>}{item.needsAttention && <strong className="attention-flag">Action required</strong>}</header>
     <p>{item.text}</p><Timeline item={item}/>
-    {item.status === "plan_ready" && <div className="plan-editor"><label>Review and edit the plan<textarea value={plan} onChange={(event) => setPlan(event.target.value)} /></label><div className="row"><button onClick={() => void action(() => api.editPlan(item.id, plan))}>Save edit</button><button className="approve" onClick={() => void action(() => api.approvePlan(item.id))}>Approve &amp; implement</button></div>{item.planOriginalText !== item.planText && <small>Edited from Claude's original draft</small>}</div>}
+    {item.status === "plan_ready" && <div className="plan-editor">
+      <label>Review and edit the plan<textarea value={plan} onChange={(event) => setPlan(event.target.value)} /></label>
+      <div className="row"><button onClick={() => void action(() => api.editPlan(item.id, plan))}>Save plan edit</button></div>
+      {item.planOriginalText !== item.planText && <small>Edited from Claude's original draft</small>}
+      {item.reviewPrompt !== null && <>
+        <label>Review instructions (given to the independent reviewer)<textarea value={reviewPrompt} onChange={(event) => setReviewPrompt(event.target.value)} /></label>
+        <div className="row"><button onClick={() => void action(() => api.editReviewPrompt(item.id, reviewPrompt))}>Save review-instructions edit</button></div>
+        {item.reviewPromptOriginalText !== item.reviewPrompt && <small>Edited from Claude's original draft</small>}
+      </>}
+      <div className="row"><button className="approve" onClick={() => void action(() => api.approvePlan(item.id))}>Approve &amp; implement</button></div>
+    </div>}
     {item.status === "review_exhausted" && <div className="review-attention"><strong>Independent review still found issues.</strong><pre>{item.reviewNotes}</pre><textarea value={instructions} onChange={(event) => setInstructions(event.target.value)} placeholder="Optional guidance for the next fix round"/><button onClick={() => void action(() => api.requestFixes(item.id, instructions))}>Request another fix round</button></div>}
     {item.resultDiffSummary && <pre>{item.resultDiffSummary}</pre>}{item.errorMessage && <p className="error">{item.errorMessage}</p>}
     <div className="row actions">
