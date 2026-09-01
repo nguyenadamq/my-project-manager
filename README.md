@@ -8,7 +8,7 @@ A private, mobile-first command center for local Git repositories. Register proj
 - SQLite persistence for projects, summaries, features, prompt jobs, usage events, and settings.
 - Allow-listed repository registration with idempotent `post-commit` trigger hooks, added by browsing your folders in the app rather than typing an absolute path: the picker walks only what `PM_ALLOWED_ROOTS` permits and labels which folders are Git repositories and which are already registered.
 - Debounced, SHA-aware summary refreshes. Anthropic synthesis is used when `ANTHROPIC_API_KEY` is present; a deterministic local summary keeps the app useful offline.
-- Two ways to start any prompt, chosen per prompt: **instant**, which begins the moment you add it, or **queued**, which waits for you to press Start or for auto-dispatch to choose it. Both run the identical pipeline in the identical isolated worktree -- the only difference is what starts it.
+- Two ways to start any prompt, chosen per prompt: **instant**, which begins the moment you add it, or **queued**, which waits for you to press Start or for auto-dispatch to choose it. Both run the identical pipeline in the identical isolated worktree. For `full`-mode prompts the plan stage -- read-only, and always followed by a separate approval checkpoint before anything is implemented -- starts immediately either way; `queued` only holds back `implement_only` prompts, which have no such checkpoint.
 - FIFO prompt queue with a mandatory approval checkpoint between planning and implementation.
 - Claude creates the plan, Codex implements the approved plan in `.pm/worktrees/<jobId>` on a `pm/<jobId>` branch, and Claude independently reviews the result.
 - Up to two automatic fix rounds after a `NEEDS-FIXES` verdict, followed by a human-attention state and an explicit option to request another round.
@@ -70,7 +70,9 @@ Everything above works the same on Windows, macOS, and Linux.
      implements it, Claude reviews the diff independently) or **Implement only** (Codex acts on
      your prompt directly; no plan checkpoint, no review).
    - *When to run* -- **Run instantly** starts it immediately, or **Queue it** leaves it waiting
-     for you to press Start or for auto-dispatch to pick it up.
+     for you to press Start or for auto-dispatch to pick it up. For **Plan → Implement → Review**
+     prompts, "Queue it" still drafts the plan right away -- only implementation waits, behind
+     your approval.
 3. **Let it run unattended (optional).** Turn on auto-dispatch in Pipeline settings and give
    each project a priority on the dashboard. It then starts the next eligible item on its own
    whenever the agents have usage headroom, so a backlog spread across several projects keeps

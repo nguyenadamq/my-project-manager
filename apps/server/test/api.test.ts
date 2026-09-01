@@ -99,6 +99,23 @@ describe("API", () => {
     await app.close();
   });
 
+  // A full-mode plan never writes to the repo, and implementation still can't start until a
+  // human approves it either way -- so unlike implement_only, "queue it" for full mode drafts
+  // the plan right away instead of leaving it undrafted until someone pushes it.
+  it("drafts a full-mode plan immediately even when queued (not pushed)", async () => {
+    const app = await buildApp(config(), { db: createDatabase(path.join(root, "queued-full.db")), runner, startWatcher: false }); const auth = { authorization: "Bearer secret" };
+    const project = (await app.inject({ method: "POST", url: "/api/projects", headers: auth, payload: { path: repo } })).json();
+    const queued = await app.inject({ method: "POST", url: `/api/projects/${project.id}/queue`, headers: auth, payload: { text: "Later, but plan now" } });
+    expect(queued.json().mode).toBe("full"); expect(queued.json().dispatch).toBe("queued");
+    const settled = await waitFor(app, project.id, queued.json().id, (status) => status === "plan_ready" || status === "failed");
+    expect(settled).toBe("plan_ready");
+    // Implementation must still wait for an explicit approval, not follow the plan
+    // automatically just because it drafted on its own.
+    const detail = await app.inject({ url: `/api/projects/${project.id}`, headers: auth });
+    expect(detail.json().queue[0].worktreePath).toBeNull();
+    await app.close();
+  });
+
   it("browses allowed roots so a project can be picked instead of typed", async () => {
     const app = await buildApp(config(), { db: createDatabase(path.join(root, "browse.db")), runner, startWatcher: false }); const auth = { authorization: "Bearer secret" };
     const roots = await app.inject({ url: "/api/browse", headers: auth });

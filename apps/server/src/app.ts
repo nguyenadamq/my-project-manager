@@ -102,7 +102,15 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
     // instant item is in every other respect an ordinary queue item -- it still waits for a
     // free concurrency slot, still runs in its own worktree, and is still cancellable while it
     // waits. The response is not held for it; progress arrives over the websocket.
-    if (item.dispatch === "instant") setImmediate(() => schedule(queue.runPlanStage(item.id)));
+    //
+    // A `full`-mode item plans eagerly regardless of dispatch: the plan stage never writes to
+    // the repo, and implementation still can't start until a human approves the plan either
+    // way, so "queue it" waiting on the plan too just means a stale plan sits undrafted until
+    // someone pushes it -- the queued/instant distinction only has teeth once there's a
+    // human checkpoint downstream to actually gate. `implement_only` has no such checkpoint
+    // (runPlanStage runs the implementation directly for that mode -- see queue.ts), so it
+    // keeps the original wait-for-push-or-instant behavior unchanged.
+    if (item.dispatch === "instant" || item.mode === "full") setImmediate(() => schedule(queue.runPlanStage(item.id)));
     return reply.code(201).send(item);
   });
   app.patch<{ Params: { promptId: string }; Body: { text?: string; position?: number; status?: "cancelled" } }>("/api/queue/:promptId", async (request) => queue.update(request.params.promptId, request.body));
