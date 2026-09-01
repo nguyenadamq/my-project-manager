@@ -10,7 +10,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "lint": "tsc -p tsconfig.json --noEmit",
-    "usage:chrome": "node scripts/launch-chrome-debug.mjs"
+    "usage:chrome": "node --env-file-if-exists=../../.env scripts/launch-chrome-debug.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.62.0",
