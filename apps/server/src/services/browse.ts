@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { BrowseEntry, BrowseResult } from "@pm/shared";
 import type { Db } from "../db.js";
-import type { Config } from "../config.js";
+import { realRoot, type Config } from "../config.js";
 
 // Directories that are never worth showing in a repository picker: they are large, noisy, and
 // can never themselves be a project root worth registering.
@@ -18,7 +18,10 @@ export class BrowseService {
   constructor(private db: Db, private config: Config) {}
 
   private contains(real: string): boolean {
-    return this.config.allowedRoots.some((root) => real === root || real.startsWith(`${root}${path.sep}`));
+    // See projects.ts's identical re-resolution: a configured root can itself sit behind a
+    // symlink (macOS's /var -> /private/var chief among them), so it needs realpath at
+    // comparison time too, not just once wherever the config happened to be built.
+    return this.config.allowedRoots.some((root) => { const r = realRoot(root); return real === r || real.startsWith(`${r}${path.sep}`); });
   }
 
   private registeredPaths(): Set<string> {

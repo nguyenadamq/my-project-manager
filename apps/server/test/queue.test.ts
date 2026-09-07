@@ -16,14 +16,31 @@ class FakeRunner implements PipelineRunner {
   planCalls = 0; implementCalls = 0; reviewCalls = 0;
   reviews: ReviewResult[] = [{ verdict: "CLEAN", notes: "Everything matches." }];
   failAt: "plan" | "implement" | "review" | null = null;
-  async plan(_input: PlanInput) { this.planCalls++; if (this.failAt === "plan") throw new Error("plan exploded"); return { text: "# Approved approach\nBuild it safely.", reviewPrompt: "Check it was built safely." }; }
+  // Set by a test before calling runPlanStage to exercise checkpoint/summary drafting; left
+  // empty by default so every existing test (which never sets these) is unaffected.
+  planCheckpoints: string[] = [];
+  planSummary = "";
+  // Optional per-test hook: called with the same onOutput the real runner would invoke, so a
+  // test can simulate the CLI streaming a PM_CHECKPOINT marker (or any other chunk) while
+  // implementing, without needing a real subprocess.
+  onImplementOutput: ((onOutput: NonNullable<ImplementInput["onOutput"]>) => void) | null = null;
+  async plan(input: PlanInput) {
+    this.planCalls++; if (this.failAt === "plan") throw new Error("plan exploded");
+    input.onOutput?.("stdout", "planning…\n");
+    return { text: "# Approved approach\nBuild it safely.", reviewPrompt: "Check it was built safely.", checkpoints: this.planCheckpoints, summary: this.planSummary || undefined };
+  }
   async implement(input: ImplementInput) {
     this.implementCalls++; if (this.failAt === "implement") throw new Error("implement exploded");
     fs.writeFileSync(path.join(input.worktree, `attempt-${this.implementCalls}.txt`), `attempt ${this.implementCalls}\n`);
+    if (input.onOutput) this.onImplementOutput?.(input.onOutput);
     return `Implementation attempt ${this.implementCalls}`;
   }
   lastReviewInput: ReviewInput | null = null;
-  async review(input: ReviewInput) { this.reviewCalls++; this.lastReviewInput = input; if (this.failAt === "review") throw new Error("review exploded"); return this.reviews[Math.min(this.reviewCalls - 1, this.reviews.length - 1)]!; }
+  async review(input: ReviewInput) {
+    this.reviewCalls++; this.lastReviewInput = input; if (this.failAt === "review") throw new Error("review exploded");
+    input.onOutput?.("stdout", "reviewing…\n");
+    return this.reviews[Math.min(this.reviewCalls - 1, this.reviews.length - 1)]!;
+  }
 }
 
 let db: DatabaseSync; let queue: QueueService; let runner: FakeRunner; let root: string; let repo: string; let mainSha: string;
@@ -51,6 +68,23 @@ describe("prompt queue pipeline", () => {
     await queue.runPlanStage(item.id); const ready = queue.list("p")[0]!;
     expect(ready).toMatchObject({ status: "plan_ready", needsAttention: true, planText: "# Approved approach\nBuild it safely.", implementEffort: "high", planModel: "sonnet" });
     expect(queue.listEvents(item.id).map((event) => event.kind)).toContain("awaiting_approval");
+  });
+
+  it("recovers a job stuck mid-run from a previous process into a retryable failure", async () => {
+    const item = queue.add("p", "Build feature");
+    await queue.runPlanStage(item.id);
+    await queue.approvePlan(item.id);
+    // Simulate the process dying mid-implement: force the row back to "implementing" as if a
+    // real run were still in flight, with no in-memory job actually driving it (a fresh
+    // QueueService, as a real restart would construct).
+    db.prepare("UPDATE queued_prompts SET status='implementing' WHERE id=?").run(item.id);
+    const fresh = new QueueService(db, new EventHub(), runner, new SettingsService(db));
+    expect(fresh.recoverInterruptedJobs()).toBe(1);
+    const recovered = fresh.list("p")[0]!;
+    expect(recovered).toMatchObject({ status: "failed", needsAttention: true });
+    expect(recovered.errorMessage).toContain("Interrupted by a server restart");
+    // A second call (e.g. building the app again in the same process) finds nothing left to do.
+    expect(fresh.recoverInterruptedJobs()).toBe(0);
   });
 
   it("marks a planning failure for human attention", async () => {
@@ -239,6 +273,76 @@ describe("prompt queue pipeline", () => {
       const item = queue.add("p", "Build feature", undefined, "implement_only");
       await expect(queue.approvePlan(item.id)).rejects.toThrow("completed plan");
       expect(() => queue.editPlan(item.id, "x")).toThrow("awaiting approval");
+    });
+  });
+
+  describe("checkpoints and live output", () => {
+    it("stores the drafted checkpoint list alongside the plan", async () => {
+      runner.planCheckpoints = ["Add the migration", "Wire up the route"];
+      const item = queue.add("p", "Build feature"); await queue.runPlanStage(item.id);
+      expect(queue.list("p")[0]).toMatchObject({ checkpoints: ["Add the migration", "Wire up the route"], checkpointIndex: 0 });
+    });
+
+    it("leaves checkpoints null when the plan didn't include any", async () => {
+      const item = queue.add("p", "Build feature"); await queue.runPlanStage(item.id);
+      expect(queue.list("p")[0]).toMatchObject({ checkpoints: null, checkpointIndex: 0 });
+    });
+
+    it("stores the drafted summary alongside the plan, and leaves it null when absent", async () => {
+      runner.planSummary = "Adds a safe build step and tests it end to end.";
+      const item = queue.add("p", "Build feature"); await queue.runPlanStage(item.id);
+      expect(queue.list("p")[0]).toMatchObject({ planSummary: "Adds a safe build step and tests it end to end." });
+
+      runner.planSummary = "";
+      const other = queue.add("p", "Another feature"); await queue.runPlanStage(other.id);
+      expect(queue.list("p").find((row) => row.id === other.id)).toMatchObject({ planSummary: null });
+    });
+
+    it("turns a PM_CHECKPOINT marker line into a persisted index and a live event, tolerating a split chunk", async () => {
+      runner.planCheckpoints = ["Add the migration", "Wire up the route"];
+      runner.onImplementOutput = (onOutput) => {
+        onOutput("stdout", "doing checkpoint 1…\n");
+        // Split across two chunks, mid-line, the way a real subprocess's data events would --
+        // the marker should still be recognized once the newline completing it arrives.
+        onOutput("stdout", 'PM_CHECKPOINT 1/2');
+        onOutput("stdout", ': Added the migration\n');
+      };
+      const hub = new EventHub(); const checkpointEvents: Array<{ index: number; total: number; description: string }> = [];
+      hub.subscribe((event) => { if (event.type === "job.checkpoint") checkpointEvents.push(event); });
+      const q = new QueueService(db, hub, runner, new SettingsService(db));
+      const item = q.add("p", "Build feature"); await q.runPlanStage(item.id); await q.approvePlan(item.id); await q.runImplementReviewLoop(item.id);
+      expect(checkpointEvents).toMatchObject([{ index: 1, total: 2, description: "Added the migration" }]);
+      expect(q.list("p")[0]).toMatchObject({ checkpointIndex: 1 });
+    });
+
+    it("does not track checkpoints during a fix round", async () => {
+      runner.planCheckpoints = ["Add the migration"];
+      runner.reviews = [{ verdict: "NEEDS-FIXES", notes: "needs work" }];
+      let fixRoundSawMarker = false;
+      runner.onImplementOutput = (onOutput) => {
+        if (runner.implementCalls > 1) onOutput("stdout", "PM_CHECKPOINT 1/1: shouldn't count\n");
+      };
+      const hub = new EventHub();
+      hub.subscribe((event) => { if (event.type === "job.checkpoint" && runner.implementCalls > 1) fixRoundSawMarker = true; });
+      const q = new QueueService(db, hub, runner, new SettingsService(db));
+      const item = q.add("p", "Build feature"); await q.runPlanStage(item.id); await q.approvePlan(item.id); await q.runImplementReviewLoop(item.id);
+      q.requestMoreFixes(item.id);
+      await q.runImplementReviewLoop(item.id, false);
+      expect(fixRoundSawMarker).toBe(false);
+    });
+
+    it("captures and resets each stage's raw output, exposed via getOutput", async () => {
+      const item = queue.add("p", "Build feature");
+      await queue.runPlanStage(item.id);
+      expect(queue.getOutput(item.id).plan.content).toContain("planning…");
+      await queue.approvePlan(item.id); await queue.runImplementReviewLoop(item.id);
+      expect(queue.getOutput(item.id).review.content).toContain("reviewing…");
+      // A fresh implement attempt (a retry, or a fix round) resets that stage's transcript
+      // rather than appending to the previous attempt's.
+      const beforeRetry = queue.getOutput(item.id).plan.content;
+      runner.failAt = "plan";
+      const retryItem = queue.add("p", "Another"); await queue.runPlanStage(retryItem.id);
+      expect(queue.getOutput(item.id).plan.content).toBe(beforeRetry); // unrelated prompt's output is untouched
     });
   });
 });

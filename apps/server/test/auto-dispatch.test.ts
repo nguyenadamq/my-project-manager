@@ -14,7 +14,7 @@ import { SettingsService } from "../src/services/settings.js";
 
 const migrations = migrationSql();
 
-function gauge(percent: number, source: UsageGauge["source"] = "live"): UsageGauge { return { percent, resetAt: null, source, checkedAt: null }; }
+function gauge(percent: number, source: UsageGauge["source"] = "live"): UsageGauge { return { percent, resetAt: null, source, checkedAt: null, detail: null }; }
 function snapshot(overrides: Partial<Omit<UsageSnapshot, "recommendation">> = {}): UsageSnapshot {
   return { claudeSession: gauge(10), claudeWeekly: gauge(10), codexFiveHour: gauge(10), codexWeekly: gauge(10), recommendation: "", ...overrides };
 }

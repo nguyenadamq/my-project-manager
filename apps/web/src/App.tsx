@@ -1,11 +1,30 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { PIPELINE_EFFORTS, PIPELINE_MODELS, type DispatchMode, type PipelineEvent, type PipelineMode, type PipelineOverrides, type PipelineStage, type Project, type UsageGauge, type UsageSnapshot } from "@pm/shared";
+import { PIPELINE_EFFORTS, PIPELINE_MODELS, type DispatchMode, type PipelineEvent, type PipelineMode, type PipelineOverrides, type PipelineStage, type Project, type QueuedPrompt, type UsageGauge, type UsageSnapshot } from "@pm/shared";
 import { api, getToken, setToken } from "./api.js";
 import { QueueItem, labels as queueLabels } from "./components/QueueItem.js";
 import { PipelineSettings, ProjectPipelineSettings } from "./components/PipelineSettings.js";
 import { FolderPicker } from "./components/FolderPicker.js";
 
 const stages: PipelineStage[] = ["plan", "implement", "review"];
+// A project's queue keeps every prompt ever added, forever -- with nothing filtering the panel,
+// a project that's been in use for a while just accumulates every past done/cancelled item on
+// top of whatever's actually active, pushing current work down the page. Hidden by default
+// (see ProjectDetail's showHistory), never lost -- just not what floods the screen at rest.
+const isFinished = (status: QueuedPrompt["status"]) => status === "done" || status === "cancelled";
+// The dashboard card's "at a glance" preview used to be `queue.slice(0, 3)` -- since position
+// only ever increases as prompts are added and a finished item keeps its original position
+// forever, that showed the 3 *oldest* prompts a project ever had, not its current work: once a
+// project passed 3 total prompts, the preview would freeze on ancient completed/cancelled ones
+// forever instead of updating to reflect what's actually happening now. This sorts active items
+// (anything not done/cancelled) first, then most-recently-added within each group, before
+// slicing to 3 -- so it only shows finished work when there's nothing active left to show.
+function cardPreview(queue: QueuedPrompt[]): QueuedPrompt[] {
+  return [...queue].sort((a, b) => {
+    const aFinished = isFinished(a.status), bFinished = isFinished(b.status);
+    if (aFinished !== bFinished) return aFinished ? 1 : -1;
+    return b.position - a.position;
+  }).slice(0, 3);
+}
 const relative = (value: string | null | undefined) => value ? new Intl.RelativeTimeFormat("en", { numeric: "auto" }).format(Math.round((Date.parse(value) - Date.now()) / 60_000), "minute") : "never";
 
 function Meter({ label, gauge, tone }: { label: string; gauge: UsageGauge; tone: string }) {
@@ -14,7 +33,7 @@ function Meter({ label, gauge, tone }: { label: string; gauge: UsageGauge; tone:
     <div className="meter-head"><span>{label}</span><strong>{gauge.source === "unknown" ? "—" : `${gauge.percent}%`}</strong></div>
     <div className="meter-track"><div style={{ width: `${gauge.percent}%`, background: tone }}/></div>
     <small className={gauge.source === "live" ? "" : "muted"}>{sourceLabel}{gauge.resetAt && ` · resets ${relative(gauge.resetAt)}`}</small>
-    {/* Why this gauge isn't live. Without it, a "Check usage now" that failed to reach Chrome
+    {/* Why this gauge isn't live. Without it, a "Check usage now" that failed to reach the CLI
         looks exactly like one that succeeded -- the gauge just keeps showing the local estimate. */}
     {gauge.detail && <small className="meter-detail" title={gauge.detail}>{gauge.detail}</small>}
   </article>;
@@ -28,6 +47,7 @@ function ProjectDetail({ id, close }: { id: string; close: () => void }) {
   const [overrides, setOverrides] = useState<PipelineOverrides>({});
   const [useOverrides, setUseOverrides] = useState(false);
   const [showProjectSettings, setShowProjectSettings] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
   const [error, setError] = useState("");
   const reportError = useCallback((message: string) => setError(message), []);
   const load = useCallback(() => { void api.project(id).then(setProject).catch((cause) => setError(cause.message)); }, [id]);
@@ -36,10 +56,15 @@ function ProjectDetail({ id, close }: { id: string; close: () => void }) {
     const protocol = location.protocol === "https:" ? "wss" : "ws";
     const socket = new WebSocket(`${protocol}://${location.host}/ws?token=${encodeURIComponent(getToken())}`);
     socket.onmessage = (message) => {
-      try {
-        const event = JSON.parse(String(message.data)) as { type: string; event?: PipelineEvent };
-        if (event.type === "pipeline.event" && event.event) window.dispatchEvent(new CustomEvent("pipeline-event", { detail: event.event }));
-      } catch { /* reload remains the compatibility baseline */ }
+      let event: { type: string; event?: PipelineEvent };
+      try { event = JSON.parse(String(message.data)) as { type: string; event?: PipelineEvent }; }
+      catch { load(); return; } // reload remains the compatibility baseline for anything unparseable
+      if (event.type === "pipeline.event" && event.event) window.dispatchEvent(new CustomEvent("pipeline-event", { detail: event.event }));
+      // job.output fires once per chunk a running CLI writes -- far too often to reload the
+      // whole project on. job.checkpoint is rare by comparison, but the terminal/progress-bar
+      // views that consume both already update themselves from the event detail, so a reload
+      // would just be a redundant round-trip either way.
+      if (event.type === "job.output" || event.type === "job.checkpoint") { window.dispatchEvent(new CustomEvent(event.type, { detail: event })); return; }
       load();
     };
     return () => socket.close();
@@ -71,7 +96,8 @@ function ProjectDetail({ id, close }: { id: string; close: () => void }) {
             <label><input type="radio" name="dispatch" checked={dispatch === "instant"} onChange={() => setDispatch("instant")}/> Run instantly <small>Starts the moment you add it — same isolated worktree, it just doesn't wait to be chosen.</small></label>
           </fieldset>
           <details open={useOverrides} onToggle={(event) => setUseOverrides((event.currentTarget as HTMLDetailsElement).open)}><summary>Model overrides (optional)</summary><div className="override-grid">{(mode === "implement_only" ? (["implement"] as const) : stages).map((stage) => <fieldset key={stage}><legend>{stage}</legend><label>Model<select value={overrides[stage]?.model ?? ""} onChange={(event) => setOverride(stage, "model", event.target.value)}><option value="">Use default</option>{PIPELINE_MODELS.map((model) => <option key={model} value={model}>{model}</option>)}</select></label><label>Effort<select value={overrides[stage]?.effort ?? ""} onChange={(event) => setOverride(stage, "effort", event.target.value)}><option value="">Use default</option>{PIPELINE_EFFORTS.map((effort) => <option key={effort} value={effort}>{effort}</option>)}</select></label></fieldset>)}</div></details><button>{dispatch === "instant" ? "Add & run now" : mode === "full" ? "Add & draft plan" : "Add to queue"}</button></form>
-        <div className="queue">{project.queue?.map((item) => <QueueItem key={item.id} item={item} reload={load} onError={reportError}/>)}</div>
+        <div className="queue">{project.queue?.filter((item) => showHistory || !isFinished(item.status)).map((item) => <QueueItem key={item.id} item={item} reload={load} onError={reportError}/>)}</div>
+        {Boolean(project.queue?.some((item) => isFinished(item.status))) && <button className="ghost history-toggle" onClick={() => setShowHistory((value) => !value)}>{showHistory ? "Hide completed & cancelled" : `Show ${project.queue!.filter((item) => isFinished(item.status)).length} completed & cancelled`}</button>}
       </section>
     </div>{showProjectSettings && <ProjectPipelineSettings projectId={id} initial={project.pipelineOverrides} close={() => setShowProjectSettings(false)} saved={load} onError={reportError}/>} {error && <div className="toast" onClick={() => setError("")}>{error}</div>}
   </main>;
@@ -83,10 +109,10 @@ export function App() {
   const [selected, setSelected] = useState<string | null>(null); const [showAdd, setShowAdd] = useState(false); const [showSettings, setShowSettings] = useState(false); const [error, setError] = useState(""); const [checkingUsage, setCheckingUsage] = useState(false);
   const reportError = useCallback((message: string) => setError(message), []);
   const load = useCallback(async () => { try { const [projectList, snapshot] = await Promise.all([api.projects(), api.usage()]); setProjects(projectList); setUsage(snapshot); setError(""); } catch (cause) { setError((cause as Error).message); } }, []);
-  // A scrape can take anywhere from a couple seconds to tens of seconds (opening real pages
-  // over CDP); the button needs to visibly say so and, critically, actually surface a failure
-  // -- the previous version had neither, so a slow or failed check looked identical to nothing
-  // having happened at all.
+  // A scrape can take anywhere from a couple seconds to tens of seconds (spawning `claude`/
+  // `codex` and waiting on their own answers); the button needs to visibly say so and,
+  // critically, actually surface a failure -- the previous version had neither, so a slow or
+  // failed check looked identical to nothing having happened at all.
   const checkUsageNow = async () => { setCheckingUsage(true); try { setUsage(await api.scrapeUsageNow()); setError(""); } catch (cause) { setError((cause as Error).message); } finally { setCheckingUsage(false); } };
   const action = async (work: () => Promise<unknown>) => { try { await work(); await load(); } catch (cause) { setError((cause as Error).message); } };
   useEffect(() => { if (tokenReady) void load(); }, [tokenReady, load]);
@@ -106,7 +132,7 @@ export function App() {
       <div className="row card-top"><span className="index">{String(index + 1).padStart(2, "0")}</span><div className="priority-stepper" onClick={(event) => event.stopPropagation()}><button className="ghost" aria-label="Lower priority" onClick={() => void action(() => api.setPriority(project.id, project.priority - 1))}>−</button><span title="Priority — higher runs first when auto-dispatch has a choice">{project.priority}</span><button className="ghost" aria-label="Raise priority" onClick={() => void action(() => api.setPriority(project.id, project.priority + 1))}>+</button></div></div>
       {Boolean(project.needsAttentionCount) && <span className="attention-badge">{project.needsAttentionCount} need{project.needsAttentionCount === 1 ? "s" : ""} attention</span>}<div className="project-title"><h3>{project.name}</h3><span className={`status ${project.lastSyncedAt ? "done" : "queued"}`}>{project.lastSyncedAt ? "up to date" : "sync pending"}</span></div><p>{project.latestFeatureMd || "Ready for the initial repository scan."}</p>
       {Boolean(project.queue?.length) && <div className="card-queue" onClick={(event) => event.stopPropagation()}>
-        {project.queue!.slice(0, 3).map((item) => <div className="card-queue-item" key={item.id}>
+        {cardPreview(project.queue!).map((item) => <div className="card-queue-item" key={item.id}>
           <span className={`status ${item.status}`}>{queueLabels[item.status]}</span>
           <span className="card-queue-text">{item.text}</span>
           {item.status === "queued" && <button className="ghost tiny" onClick={() => void action(() => api.pushPrompt(item.id))}>Start</button>}

@@ -59,6 +59,22 @@ export interface QueuedPrompt {
   // and for plan_ready rows from before this field existed.
   reviewPrompt: string | null;
   reviewPromptOriginalText: string | null;
+  // Drafted by the same plan-stage call: a short, human-facing readout of what's being added,
+  // briefly how, and what's tested -- shown by default when reviewing the plan, instead of the
+  // full plan text (which stays available, and still editable, behind its own toggle). Null for
+  // implement_only items (no plan stage), a plan response that skipped the section, and
+  // plan_ready rows from before this field existed.
+  planSummary: string | null;
+  // Drafted by the same plan-stage call, in order: concrete implementation milestones Codex is
+  // asked to tick off one at a time during the (non-fix) implement stage. Null/empty for
+  // implement_only items (no plan stage), a plan response that didn't include a checkpoint
+  // list, and plan_ready rows from before this field existed -- all of which mean "no progress
+  // bar to show", not an error.
+  checkpoints: string[] | null;
+  // How many of `checkpoints` Codex has reported finishing so far in the current (non-fix)
+  // implement attempt. Only advances during the first implement pass -- a fix round doesn't
+  // re-track it, since fix work doesn't map onto the original checkpoint list.
+  checkpointIndex: number;
   planApprovedAt: string | null;
   fixRoundsUsed: number;
   reviewVerdict: "CLEAN" | "NEEDS-FIXES" | null;
@@ -156,4 +172,13 @@ export type RealtimeEvent =
   | { type: "queue.updated"; projectId: string }
   | { type: "job.progress"; projectId: string; promptId: string; status: QueueStatus }
   | { type: "usage.updated" }
-  | { type: "pipeline.event"; projectId: string; promptId: string; event: PipelineEvent };
+  | { type: "pipeline.event"; projectId: string; promptId: string; event: PipelineEvent }
+  // A raw slice of a running CLI's own stdout/stderr, forwarded live as it's produced -- not
+  // persisted history like PipelineEvent, just a tail for whoever has a terminal view open.
+  // Fired often (every chunk the subprocess writes), so a listener should never treat this as
+  // a cue to refetch anything; it exists to be appended to a buffer, nothing else.
+  | { type: "job.output"; projectId: string; promptId: string; stage: PipelineStage; stream: "stdout" | "stderr"; chunk: string }
+  // Codex reported finishing checkpoint `index` of `total` (see QueuedPrompt.checkpoints) by
+  // running the PM_CHECKPOINT marker command the implement prompt asks for -- self-reported by
+  // the same agent doing the work, not independently verified.
+  | { type: "job.checkpoint"; projectId: string; promptId: string; index: number; total: number; description: string };

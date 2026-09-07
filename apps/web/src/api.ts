@@ -1,4 +1,4 @@
-import type { AutoDispatchSettings, BrowseResult, DispatchMode, PipelineDefaults, PipelineEvent, PipelineMode, PipelineOverrides, Project, QueuedPrompt, UsageSnapshot } from "@pm/shared";
+import type { AutoDispatchSettings, BrowseResult, DispatchMode, PipelineDefaults, PipelineEvent, PipelineMode, PipelineOverrides, PipelineStage, Project, QueuedPrompt, UsageSnapshot } from "@pm/shared";
 
 const tokenKey = "pm-auth-token";
 export const getToken = () => localStorage.getItem(tokenKey) ?? "";
@@ -32,6 +32,7 @@ export const api = {
   retryFailed: (id: string) => request(`/api/queue/${id}/retry`, { method: "POST" }),
   requestFixes: (id: string, instructions?: string) => request(`/api/queue/${id}/request-fixes`, { method: "POST", body: JSON.stringify({ instructions }) }),
   pipelineEvents: (id: string) => request<PipelineEvent[]>(`/api/queue/${id}/events`),
+  pipelineOutput: (id: string) => request<Record<PipelineStage, { content: string; truncated: boolean }>>(`/api/queue/${id}/output`),
   getPipelineSettings: () => request<PipelineDefaults>("/api/settings/pipeline"),
   setPipelineSettings: (settings: PipelineOverrides) => request<PipelineDefaults>("/api/settings/pipeline", { method: "PUT", body: JSON.stringify(settings) }),
   patchProject: (id: string, pipelineOverrides: PipelineOverrides | null) => request<Project>(`/api/projects/${id}`, { method: "PATCH", body: JSON.stringify({ pipelineOverrides }) }),

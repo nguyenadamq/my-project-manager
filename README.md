@@ -16,9 +16,11 @@ A private, mobile-first command center for local Git repositories. Register proj
 - Two pipeline modes, chosen per prompt: the supervised `full` Plan → Implement → Review loop above, or `implement_only`, which skips the plan draft/approval checkpoint and the independent review — Codex acts on your prompt directly, still isolated in its own worktree/branch.
 - Per-stage model and reasoning settings with global defaults, project overrides, and optional run overrides. Every run stores its resolved configuration.
 - Persistent pipeline event history, live status updates, attention badges, editable plans, and a three-stage timeline in the PWA.
+- The plan stage drafts a checkpoint list alongside the plan itself -- concrete, sequential implementation milestones. During the initial implement pass (not fix rounds), Codex reports finishing each one, which renders as a live progress bar. Self-reported by the same agent doing the work, so treat it as a best-effort indicator, not a verified one.
+- A live terminal view, nested behind its own collapsed toggle on each queue item so it never floods the queue list: streams each stage's raw CLI output as it's produced, in a bounded-height scrolling window, with per-stage tabs and auto-scroll.
 - Jobs never merge or push automatically, and failed worktrees are retained for inspection.
 - Claude and Codex are invoked through their own subscription CLI login, the same way whether Project Manager or you runs them: `claude`/`codex` are resolved from `PATH` (overridable), and any `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` in the server's own environment is stripped from their subprocess env so they never fall back to pay-per-token API billing. Prompts and plan text are piped through stdin rather than passed as CLI arguments, so large repository context never hits Windows' command-line length limit.
-- Live usage tracking: real percentages and reset times read directly from claude.ai's and chatgpt.com's own usage pages over Chrome's remote-debugging protocol -- signed in through an ordinary, non-automated browser window (once), never through an automated login that would trip anti-bot defenses. Falls back to a local-transcript estimate, then a manual tally, then "unknown" -- never a fabricated number.
+- Live usage tracking: real percentages and reset times read directly from `claude`'s and `codex`'s own CLIs (Claude Code's `/usage`, Codex's `/status`) -- no browser, no separate sign-in, no extra process to keep running. A fresh read is triggered opportunistically after every pipeline CLI turn, plus a periodic fallback for an idle app. Falls back to a local-transcript estimate, then a manual tally, then "unknown" -- never a fabricated number.
 - Auto-dispatch (off by default): when enabled, automatically starts the next waiting item -- across every project -- whenever every usage pool that item would draw on has headroom, so work keeps flowing out as soon as the agents are ready instead of waiting for you to be at the keyboard. Covers both `implement_only` items and, since there's already a human-authored prompt behind every queued item, auto-approving `full`-mode plans too.
 - Auto-dispatch picks *which* item on three rules, in order: highest project priority; then anything already planned before anything new (a drafted plan has already been paid for and goes stale if it waits); then, when one agent's windows are under more pressure than the other's, the work that doesn't need the constrained one -- an `implement_only` item spends Codex alone, a `full` item spends both Claude and Codex. Queue position breaks any remaining tie.
 - Per-project priority ranking, used by both the dashboard's ordering and auto-dispatch's tie-breaking.
@@ -61,6 +63,30 @@ to port 4174.
 
 Everything above works the same on Windows, macOS, and Linux.
 
+### Running unattended (production)
+
+`pnpm start` is fine for a foreground session, but the whole point of auto-dispatch is a backlog
+that keeps moving while you're not watching it -- which means the server itself needs to survive
+being closed, a reboot, or a crash. `ecosystem.config.cjs` runs it under
+[pm2](https://pm2.keymetrics.io/) with `autorestart: true`:
+
+```bash
+pnpm build
+npx pm2 start ecosystem.config.cjs
+npx pm2 save          # re-applies this process list on the next `pm2 resurrect` / startup hook
+npx pm2 startup       # prints the OS-specific command to launch pm2 itself on boot
+```
+
+If the process does die mid-run (a crash, `pm2` restarting it, the machine rebooting), any queue
+item pm2 catches mid-`planning`/`implementing`/`reviewing`/`fixing` is recovered as a `failed`
+item needing attention the moment the new process boots, rather than sitting stuck forever
+looking like it's still going -- see `queue.ts`'s `recoverInterruptedJobs`. Retry it the same way
+you would any other failure: implement/review failures resume from the worktree already on disk,
+planning failures start over from `queued`.
+
+`npx pm2 logs project-manager` tails output; `pnpm build && npx pm2 restart project-manager`
+picks up new code the same way `pnpm start` does in the foreground case.
+
 ## Using it
 
 1. **Add a project.** "+ Add project" opens a folder picker that walks your allowed roots. Open
@@ -82,25 +108,15 @@ Everything above works the same on Windows, macOS, and Linux.
 
 ### Why not Docker
 
-This app is a single Node process with an embedded SQLite file -- there's no second service (database, cache, etc.) for Docker to usefully separate out, unlike a multi-service stack. More importantly, three things it depends on all live on your host machine specifically, not something a container should own: the `claude`/`codex` CLIs' own OAuth logins (`~/.claude`, `~/.codex`), the Git repositories it registers and creates worktrees in (arbitrary host paths under `PM_ALLOWED_ROOTS`), and, for live usage tracking, your own already-running host Chrome. Containerizing would mean bind-mounting all three across the Docker Desktop boundary for no real benefit over just running the one process directly -- `pnpm start` is the simpler and more reliable path here.
+This app is a single Node process with an embedded SQLite file -- there's no second service (database, cache, etc.) for Docker to usefully separate out, unlike a multi-service stack. More importantly, two things it depends on both live on your host machine specifically, not something a container should own: the `claude`/`codex` CLIs' own OAuth logins (`~/.claude`, `~/.codex`), and the Git repositories it registers and creates worktrees in (arbitrary host paths under `PM_ALLOWED_ROOTS`). Containerizing would mean bind-mounting both across the Docker Desktop boundary for no real benefit over just running the one process directly -- `pnpm start` is the simpler and more reliable path here.
 
 ## Live usage tracking
 
-Optional, and on by default (`PM_USAGE_SCRAPE_ENABLED=true`). It reads the real percentages and reset times from claude.ai's and chatgpt.com's own usage pages by attaching over Chrome's remote-debugging protocol (CDP) to a Chrome window it can read.
+Optional, and on by default (`PM_USAGE_SCRAPE_ENABLED=true`). It reads the real percentages and reset times straight from the two CLIs' own account-usage answers: `claude -p "/usage"` and, in a headless pseudo-terminal, Codex's interactive `/status` panel (Codex has no scriptable equivalent). Both are local, free -- no tokens spent, no browser, nothing to sign into separately.
 
-It works on Windows, macOS, and Linux, and needs its own dedicated Chrome profile, not your everyday one -- and not by choice: Chrome's own security hardening refuses to open a debugging port on your default profile at all, full stop, no flag around it. So this uses a separate profile directory instead:
+A fresh read is triggered opportunistically right after every plan/implement/review CLI turn a pipeline runs, so gauges usually reflect reality within moments of the last thing that actually spent usage. `PM_USAGE_SCRAPE_INTERVAL_MS` (10 minutes by default) is only the fallback heartbeat for an otherwise-idle app, and the dashboard's "Check usage now" button forces an immediate read at any time.
 
-```bash
-pnpm usage:chrome
-```
-
-The first time, this opens a **plain, ordinary, non-automated** Chrome window (nothing is driving it yet) already pointed at both usage pages -- sign into claude.ai and chatgpt.com there once, the same way you'd sign in anywhere. That distinction matters: automation only ever attaches afterward, over CDP, to *read* a page you're already signed into -- it never drives the login itself, which is exactly what trips Cloudflare's bot defenses on both sites (an earlier version of this feature drove the login through Playwright directly and reliably got flagged; this doesn't). Every later launch reuses that same profile and is already signed in. It runs alongside your everyday Chrome with no conflict -- different profiles, independent processes, nothing to close first.
-
-Leave that window running. The server checks it every `PM_USAGE_SCRAPE_INTERVAL_MS` (10 minutes by default), briefly opening and closing a background tab in it to each usage page; nothing is ever typed into those pages -- it's read-only.
-
-If Chrome isn't reachable at `PM_CHROME_CDP_URL` (default `http://127.0.0.1:9222`) when a check runs, gauges fall back to a local-transcript estimate for Claude's session window (a crude proxy -- raw local token count against an arbitrary configured limit, not Anthropic's real rate-limit formula, so treat a high reading here as "check the real number," not gospel), "unknown" for anything with no such fallback, and the dashboard's "Check usage now" button lets you force an immediate read once Chrome is up.
-
-Note: an open remote-debugging port is a local attack surface (any local process, or a malicious page via DNS rebinding, could in principle drive that Chrome window) -- `PM_CHROME_CDP_URL` defaults to `127.0.0.1` only for this reason; don't change it to bind beyond localhost, and only run `usage:chrome` when you want tracking active.
+If a read fails (the CLI isn't on `PATH`, isn't signed in, or its output format changed), gauges fall back to a local-transcript estimate for Claude's session window (a crude proxy -- raw local token count against an arbitrary configured limit, not Anthropic's real rate-limit formula, so treat a high reading here as "check the real number," not gospel), "unknown" for anything with no such fallback -- never a fabricated number.
 
 ## API
 

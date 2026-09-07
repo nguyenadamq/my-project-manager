@@ -36,7 +36,7 @@ export class UsageService {
   }
 
   // Explicit "check now" request from the UI, in addition to the interval loop in
-  // usage-scraper.ts. Kept here (rather than only on the scraper) so callers depend on
+  // cli-usage-scraper.ts. Kept here (rather than only on the scraper) so callers depend on
   // UsageService alone; app.ts wires the actual scraper instance in.
   // Returns the live gauge when there is a usable one, and otherwise *why* there isn't -- the
   // reason is what the UI needs to explain a "Check usage now" that changed nothing. A pool that
@@ -46,11 +46,11 @@ export class UsageService {
     if (!row) return { gauge: null, detail: null };
     if (row.error) return { gauge: null, detail: row.error };
     // A reading older than 2x the scrape interval is stale enough that showing it as "live"
-    // would be misleading (the scraper may be stuck, or Chrome/the profile may be unreachable);
+    // would be misleading (the scraper may be stuck, or `claude`/`codex` may be unreachable);
     // fall through to the estimate/unknown path instead, saying so.
     const ageMs = now.getTime() - Date.parse(row.checkedAt);
     if (!Number.isFinite(ageMs) || ageMs > this.config.usageScrapeIntervalMs * 2) {
-      return { gauge: null, detail: `The last live reading is ${Math.round(ageMs / 60_000)} minutes old, well past the ${Math.round(this.config.usageScrapeIntervalMs / 60_000)}-minute check interval, so it is no longer shown as live. Is the usage Chrome window still open?` };
+      return { gauge: null, detail: `The last live reading is ${Math.round(ageMs / 60_000)} minutes old, well past the ${Math.round(this.config.usageScrapeIntervalMs / 60_000)}-minute check interval, so it is no longer shown as live. Is a pipeline stage running (or "Check usage now")?` };
     }
     return { gauge: { percent: row.percentUsed, resetAt: row.resetsAt, source: "live", checkedAt: row.checkedAt, detail: null }, detail: null };
   }
@@ -111,7 +111,7 @@ const withDetail = (gauge: UsageGauge, detail: string | null): UsageGauge => det
 
 function recommend(gauges: { claudeSession: UsageGauge; claudeWeekly: UsageGauge; codexFiveHour: UsageGauge; codexWeekly: UsageGauge }): string {
   const known = Object.values(gauges).filter((g) => g.source !== "unknown");
-  if (known.length === 0) return "Live usage isn't connected yet -- run `pnpm usage:chrome`, sign in once, and leave that window open to see real percentages here.";
+  if (known.length === 0) return "Live usage isn't connected yet -- run a pipeline stage once (or click \"Check usage now\") to see real percentages here.";
   const claudeHigh = [gauges.claudeSession, gauges.claudeWeekly].some((g) => g.source !== "unknown" && g.percent >= 80);
   const codexHigh = [gauges.codexFiveHour, gauges.codexWeekly].some((g) => g.source !== "unknown" && g.percent >= 80);
   if (claudeHigh && !codexHigh) return "Claude usage is high; Codex has more headroom for the next task.";

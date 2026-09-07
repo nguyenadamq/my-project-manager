@@ -28,7 +28,7 @@ describe("UsageService.snapshot", () => {
     // Isolated from whatever the machine running these tests actually has in its real
     // ~/.claude/projects -- otherwise estimateClaudeSession's real-usage fallback makes this
     // suite non-deterministic (and slow) depending on the developer's own recent Claude usage.
-    config = { host: "127.0.0.1", port: 0, databasePath: "", authToken: "x", allowedRoots: [], concurrency: 1, syncDebounceMs: 0, chatgptWeeklyLimit: 100, chatgptResetDay: 1, claudeFiveHourLimit: 1000, cliTimeoutMs: 1000, claudeCliPath: "claude", codexCliPath: "codex", usageScrapeEnabled: true, usageScrapeIntervalMs: 600_000, chromeCdpUrl: "http://127.0.0.1:9222", claudeProjectsPath: path.join(root, "no-claude-projects") };
+    config = { host: "127.0.0.1", port: 0, databasePath: "", authToken: "x", allowedRoots: [], concurrency: 1, syncDebounceMs: 0, chatgptWeeklyLimit: 100, chatgptResetDay: 1, claudeFiveHourLimit: 1000, cliTimeoutMs: 1000, claudeCliPath: "claude", codexCliPath: "codex", usageScrapeEnabled: true, usageScrapeIntervalMs: 600_000, claudeProjectsPath: path.join(root, "no-claude-projects"), codexUsageCwd: root };
     db = new DatabaseSync(":memory:");
     for (const sql of migrationSql()) db.exec(sql);
     usage = new UsageService(db, config, new EventHub());

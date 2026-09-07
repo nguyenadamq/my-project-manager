@@ -8,8 +8,8 @@ interface Candidate { id: string; status: "queued" | "plan_ready"; mode: "full" 
 
 // A pool with no live/estimated reading yet ("unknown") never blocks dispatch -- usage tracking
 // is an enhancement layered on top of the existing concurrency-slot gate in QueueService, not a
-// new hard requirement, so auto-dispatch still works (just without the smart gating) before
-// `pnpm usage:chrome` has ever been run.
+// new hard requirement, so auto-dispatch still works (just without the smart gating) before the
+// first scrape has ever landed (or if `claude`/`codex` aren't reachable at all).
 function underThreshold(gauge: UsageSnapshot[keyof Omit<UsageSnapshot, "recommendation">], maxPercentUsed: number): boolean {
   return gauge.source === "unknown" || gauge.percent < maxPercentUsed;
 }

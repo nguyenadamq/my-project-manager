@@ -3,7 +3,7 @@ import path from "node:path";
 import { nanoid } from "nanoid";
 import type { PipelineOverrides, Project } from "@pm/shared";
 import type { Db } from "../db.js";
-import type { Config } from "../config.js";
+import { realRoot, type Config } from "../config.js";
 import { assertGitRepository, getRepoMetadata, installPostCommitHook } from "./git.js";
 import { mapPrompt, selectQueue } from "./queue.js";
 
@@ -42,7 +42,11 @@ export class ProjectService {
   async add(inputPath: string, name?: string): Promise<Project> {
     const requested = path.resolve(inputPath);
     const real = await fs.realpath(requested);
-    if (!this.config.allowedRoots.some((root) => real === root || real.startsWith(`${root}${path.sep}`))) throw new Error("Project path is outside PM_ALLOWED_ROOTS");
+    // Re-resolves each configured root through realpath here too, not just once at config
+    // load: a root can itself sit behind a symlink (macOS's /var -> /private/var chief among
+    // them), and comparing that raw form against `real` (already realpath'd) would wrongly
+    // reject every project underneath it.
+    if (!this.config.allowedRoots.some((root) => { const r = realRoot(root); return real === r || real.startsWith(`${r}${path.sep}`); })) throw new Error("Project path is outside PM_ALLOWED_ROOTS");
     await assertGitRepository(real);
     const metadata = await getRepoMetadata(real);
     if (metadata.root !== real) throw new Error("Path must be the repository root");

@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 
 // Claude Code and Codex both authenticate through their own CLI login (a Pro/Max or
 // ChatGPT subscription session stored by the CLI itself) rather than an API key. This
@@ -37,7 +38,7 @@ export function quoteWindowsArg(arg: string): string {
   return result;
 }
 
-export function runCli(command: string, args: string[], options: { cwd?: string; stdin?: string; maxBuffer?: number; timeoutMs?: number } = {}): Promise<{ stdout: string; stderr: string }> {
+export function runCli(command: string, args: string[], options: { cwd?: string; stdin?: string; maxBuffer?: number; timeoutMs?: number; onChunk?: (stream: "stdout" | "stderr", text: string) => void } = {}): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const useShell = process.platform === "win32" && !path.isAbsolute(command);
     // With useShell, the entire quoted command line is built ourselves and passed as the sole
@@ -78,11 +79,24 @@ export function runCli(command: string, args: string[], options: { cwd?: string;
       child.kill("SIGTERM");
       reject(new Error(`${command} timed out after ${timeoutMs}ms and was terminated`));
     }, timeoutMs);
+    // Separate decoders from the final Buffer.concat().toString() above: `onChunk` needs text
+    // as it arrives, not just once at the end, and StringDecoder (not a raw .toString() per
+    // chunk) is what keeps a multi-byte UTF-8 character split across two "data" events from
+    // rendering as a mangled placeholder in a live view -- it holds back any incomplete
+    // trailing sequence until the rest of it shows up in a later chunk.
+    const stdoutDecoder = options.onChunk && new StringDecoder("utf8");
+    const stderrDecoder = options.onChunk && new StringDecoder("utf8");
     // stdout/stderr are always requested as "pipe" above regardless of the stdin branch, so
     // these are never actually null -- the conditional first element of `stdio` just widens
     // TypeScript's inferred tuple type past what it can narrow on its own.
-    child.stdout!.on("data", (chunk: Buffer) => { if (stdoutLength + chunk.length <= maxBuffer) { stdoutChunks.push(chunk); stdoutLength += chunk.length; } else overflow = true; });
-    child.stderr!.on("data", (chunk: Buffer) => { if (stderrLength + chunk.length <= maxBuffer) { stderrChunks.push(chunk); stderrLength += chunk.length; } else overflow = true; });
+    child.stdout!.on("data", (chunk: Buffer) => {
+      if (stdoutLength + chunk.length <= maxBuffer) { stdoutChunks.push(chunk); stdoutLength += chunk.length; } else overflow = true;
+      const text = stdoutDecoder?.write(chunk); if (text) options.onChunk!("stdout", text);
+    });
+    child.stderr!.on("data", (chunk: Buffer) => {
+      if (stderrLength + chunk.length <= maxBuffer) { stderrChunks.push(chunk); stderrLength += chunk.length; } else overflow = true;
+      const text = stderrDecoder?.write(chunk); if (text) options.onChunk!("stderr", text);
+    });
     child.on("error", (error) => { if (settled) return; settled = true; clearTimeout(timer); reject(error); });
     child.on("close", (code) => {
       if (settled) return; settled = true; clearTimeout(timer);

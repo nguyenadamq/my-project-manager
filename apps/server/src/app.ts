@@ -5,6 +5,7 @@ import websocket from "@fastify/websocket";
 import staticPlugin from "@fastify/static";
 import path from "node:path";
 import fs from "node:fs";
+import { timingSafeEqual } from "node:crypto";
 import type { Config } from "./config.js";
 import { createDatabase, type Db } from "./db.js";
 import { EventHub } from "./events.js";
@@ -15,12 +16,22 @@ import { QueueService } from "./services/queue.js";
 import { RealPipelineRunner, type PipelineRunner } from "./services/pipeline-runner.js";
 import { SettingsService } from "./services/settings.js";
 import { UsageService } from "./services/usage.js";
-import { UsageScraper } from "./services/usage-scraper.js";
+import { CliUsageScraper } from "./services/cli-usage-scraper.js";
 import { AutoDispatchService, AutoDispatchSettingsStore } from "./services/auto-dispatch.js";
 import { TriggerWatcher } from "./services/watcher.js";
 import type { AutoDispatchSettings, DispatchMode, PipelineMode, PipelineOverrides } from "@pm/shared";
 
 export interface BuildOptions { db?: Db; runner?: PipelineRunner; startWatcher?: boolean }
+
+// A plain `===` on the bearer token leaks its length (and, in principle, a byte at a time) via
+// how long the comparison takes -- timingSafeEqual is the standard fix. It requires equal-length
+// buffers, so a length mismatch is checked first: that alone still reveals length, not content,
+// which is a far smaller signal than confirming or ruling out prefix bytes one at a time would
+// be, and unavoidable without hashing the token to a fixed length first.
+function tokenMatches(provided: string, expected: string): boolean {
+  const a = Buffer.from(provided); const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
 
 export async function buildApp(config: Config, options: BuildOptions = {}): Promise<FastifyInstance> {
   const app = Fastify({ logger: process.env.NODE_ENV !== "test" });
@@ -30,9 +41,28 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   const browse = new BrowseService(db, config);
   const summaries = new SummaryService(db, events);
   const settings = new SettingsService(db);
-  const queue = new QueueService(db, events, options.runner ?? new RealPipelineRunner(config.cliTimeoutMs, config.claudeCliPath, config.codexCliPath), settings, config.concurrency);
   const usage = new UsageService(db, config, events);
-  const usageScraper = new UsageScraper(db, events, { enabled: config.usageScrapeEnabled, intervalMs: config.usageScrapeIntervalMs, cdpUrl: config.chromeCdpUrl });
+  const usageScraper = new CliUsageScraper(db, events, {
+    enabled: config.usageScrapeEnabled,
+    intervalMs: config.usageScrapeIntervalMs,
+    claudeCliPath: config.claudeCliPath,
+    codexCliPath: config.codexCliPath,
+    claudeTimeoutMs: config.cliTimeoutMs,
+    codexCwd: config.codexUsageCwd,
+  });
+  // Piggybacks the live-usage read on every real plan/implement/review CLI turn (see
+  // queue.ts's onCliTurnFinished) instead of waiting on only the scraper's own fallback
+  // interval, so gauges update the moment a run actually spends usage.
+  // Gated on usageScrapeEnabled, same as the scraper's own interval: when tracking is off,
+  // nothing should spawn `claude`/`codex` on its own -- only an explicit "check now" call
+  // (scrape-now below) forces a real read regardless of this setting.
+  const queue = new QueueService(db, events, options.runner ?? new RealPipelineRunner(config.cliTimeoutMs, config.claudeCliPath, config.codexCliPath), settings, config.concurrency, () => { if (config.usageScrapeEnabled) void usageScraper.scrapeOnce(); });
+  // A row left in a subprocess-driven status (planning/implementing/reviewing/fixing) at the
+  // moment this process boots can only be a leftover from a previous process that died mid-run
+  // -- nothing in this fresh process is actually running it. See queue.ts's
+  // recoverInterruptedJobs for what happens to each one.
+  const recovered = queue.recoverInterruptedJobs();
+  if (recovered > 0) app.log.warn(`Recovered ${recovered} job(s) interrupted by a previous shutdown; marked failed and available to retry.`);
   const autoDispatchSettings = new AutoDispatchSettingsStore(db);
   const watcher = new TriggerWatcher(db, summaries, config.syncDebounceMs);
   const background = new Set<Promise<unknown>>();
@@ -60,7 +90,8 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   await app.register(websocket);
   app.addHook("onRequest", async (request, reply) => {
     if (request.url === "/api/health" || !request.url.startsWith("/api/")) return;
-    if (request.headers.authorization !== `Bearer ${config.authToken}`) return reply.code(401).send({ error: "Unauthorized" });
+    const header = request.headers.authorization;
+    if (!header?.startsWith("Bearer ") || !tokenMatches(header.slice(7), config.authToken)) return reply.code(401).send({ error: "Unauthorized" });
   });
   app.setErrorHandler((error, _request, reply) => {
     const message = error instanceof Error ? error.message : String(error);
@@ -140,6 +171,7 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
     return reply.code(202).send({ accepted: true });
   });
   app.get<{ Params: { promptId: string } }>("/api/queue/:promptId/events", async (request) => queue.listEvents(request.params.promptId));
+  app.get<{ Params: { promptId: string } }>("/api/queue/:promptId/output", async (request) => queue.getOutput(request.params.promptId));
   app.get("/api/settings/pipeline", async () => settings.getGlobalDefaults());
   app.put<{ Body: PipelineOverrides }>("/api/settings/pipeline", async (request) => settings.setGlobalDefaults(request.body));
   app.get("/api/usage", async () => usage.snapshot());
@@ -148,7 +180,7 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   app.get("/api/settings/auto-dispatch", async () => autoDispatchSettings.get());
   app.put<{ Body: Partial<AutoDispatchSettings> }>("/api/settings/auto-dispatch", async (request) => autoDispatchSettings.set(request.body));
   app.get<{ Querystring: { token?: string } }>("/ws", { websocket: true }, (socket, request) => {
-    if (request.query.token !== config.authToken) return socket.close(1008, "Unauthorized");
+    if (!request.query.token || !tokenMatches(request.query.token, config.authToken)) return socket.close(1008, "Unauthorized");
     const unsubscribe = events.subscribe((event) => socket.send(JSON.stringify(event)));
     socket.on("close", unsubscribe);
   });
@@ -168,9 +200,14 @@ export async function buildApp(config: Config, options: BuildOptions = {}): Prom
   }
   app.addHook("onClose", async () => {
     if (autoDispatchTimer) clearInterval(autoDispatchTimer);
+    // Stop taking new scrapes now (queue.ts's onCliTurnFinished can still fire while `background`
+    // drains below, but scrapeOnce becomes a no-op once this flips), then let everything already
+    // running -- the watcher, background summary syncs, and whichever scrape was mid-flight --
+    // finish before the database goes away underneath it.
     usageScraper.stop();
     await watcher.stop();
     await Promise.allSettled(background);
+    await usageScraper.settle();
     db.close();
   });
   return app;

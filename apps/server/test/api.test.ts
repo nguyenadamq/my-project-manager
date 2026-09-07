@@ -23,7 +23,7 @@ beforeEach(() => {
 });
 afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 
-const config = (): Config => ({ host: "127.0.0.1", port: 0, databasePath: path.join(root, "test.db"), authToken: "secret", allowedRoots: [root], concurrency: 1, syncDebounceMs: 0, chatgptWeeklyLimit: 100, chatgptResetDay: 1, claudeFiveHourLimit: 1000, cliTimeoutMs: 60_000, claudeCliPath: "claude", codexCliPath: "codex", usageScrapeEnabled: false, usageScrapeIntervalMs: 600_000, chromeCdpUrl: "http://127.0.0.1:9222", claudeProjectsPath: path.join(root, "no-claude-projects") });
+const config = (): Config => ({ host: "127.0.0.1", port: 0, databasePath: path.join(root, "test.db"), authToken: "secret", allowedRoots: [root], concurrency: 1, syncDebounceMs: 0, chatgptWeeklyLimit: 100, chatgptResetDay: 1, claudeFiveHourLimit: 1000, cliTimeoutMs: 60_000, claudeCliPath: "claude", codexCliPath: "codex", usageScrapeEnabled: false, usageScrapeIntervalMs: 600_000, claudeProjectsPath: path.join(root, "no-claude-projects"), codexUsageCwd: root });
 
 // The pipeline runs in the background after a 202/201, so tests poll the item's own status
 // rather than guessing at a sleep long enough for a worktree add plus two subprocess stubs.
@@ -42,7 +42,14 @@ async function waitFor(app: Awaited<ReturnType<typeof buildApp>>, projectId: str
 describe("API", () => {
   it("enforces authentication", async () => {
     const app = await buildApp(config(), { db: createDatabase(path.join(root, "a.db")), runner, startWatcher: false });
-    expect((await app.inject({ url: "/api/projects" })).statusCode).toBe(401); await app.close();
+    expect((await app.inject({ url: "/api/projects" })).statusCode).toBe(401);
+    // Both a wrong token of the same length and one of a different length must be rejected --
+    // the timing-safe comparison branches on length before ever touching timingSafeEqual, so a
+    // mismatch on either side needs its own case.
+    expect((await app.inject({ url: "/api/projects", headers: { authorization: "Bearer wrongwrongwrong" } })).statusCode).toBe(401);
+    expect((await app.inject({ url: "/api/projects", headers: { authorization: "Bearer short" } })).statusCode).toBe(401);
+    expect((await app.inject({ url: "/api/projects", headers: { authorization: "Bearer secret" } })).statusCode).toBe(200);
+    await app.close();
   });
   it("registers a repo and queues a prompt", async () => {
     const app = await buildApp(config(), { db: createDatabase(path.join(root, "b.db")), runner, startWatcher: false });

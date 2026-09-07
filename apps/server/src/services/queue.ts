@@ -7,7 +7,7 @@ import type { PipelineRunner } from "./pipeline-runner.js";
 import type { SettingsService } from "./settings.js";
 
 const activeStatuses: QueueStatus[] = ["planning", "implementing", "reviewing", "fixing"];
-export const selectQueue = `SELECT id,project_id projectId,text,position,status,mode,dispatch,created_at createdAt,started_at startedAt,finished_at finishedAt,result_branch resultBranch,result_diff_summary resultDiffSummary,error_message errorMessage,needs_attention needsAttention,worktree_path worktreePath,base_sha baseSha,plan_text planText,plan_original_text planOriginalText,review_prompt reviewPrompt,review_prompt_original_text reviewPromptOriginalText,plan_approved_at planApprovedAt,fix_rounds_used fixRoundsUsed,review_verdict reviewVerdict,review_notes reviewNotes,run_overrides runOverrides,plan_model planModel,plan_effort planEffort,implement_model implementModel,implement_effort implementEffort,review_model reviewModel,review_effort reviewEffort FROM queued_prompts`;
+export const selectQueue = `SELECT id,project_id projectId,text,position,status,mode,dispatch,created_at createdAt,started_at startedAt,finished_at finishedAt,result_branch resultBranch,result_diff_summary resultDiffSummary,error_message errorMessage,needs_attention needsAttention,worktree_path worktreePath,base_sha baseSha,plan_text planText,plan_original_text planOriginalText,plan_summary planSummary,review_prompt reviewPrompt,review_prompt_original_text reviewPromptOriginalText,plan_approved_at planApprovedAt,fix_rounds_used fixRoundsUsed,review_verdict reviewVerdict,review_notes reviewNotes,run_overrides runOverrides,plan_model planModel,plan_effort planEffort,implement_model implementModel,implement_effort implementEffort,review_model reviewModel,review_effort reviewEffort,checkpoints,checkpoint_index checkpointIndex FROM queued_prompts`;
 
 export function mapPrompt(row: Record<string, unknown> | undefined): QueuedPrompt | null {
   if (!row) return null;
@@ -15,6 +15,7 @@ export function mapPrompt(row: Record<string, unknown> | undefined): QueuedPromp
     ...row,
     needsAttention: Boolean(row.needsAttention),
     runOverrides: row.runOverrides ? JSON.parse(String(row.runOverrides)) as PipelineOverrides : null,
+    checkpoints: row.checkpoints ? JSON.parse(String(row.checkpoints)) as string[] : null,
   } as QueuedPrompt;
 }
 
@@ -28,11 +29,42 @@ export class QueueService {
   private runningProjects = new Set<string>();
   private runningGlobal = 0;
   private slotWaiters: Array<() => void> = [];
+  // Holds each (promptId,stage)'s trailing partial line between chunks, so a PM_CHECKPOINT
+  // marker split across two "data" events is still recognized once the newline that completes
+  // it arrives. Cleared by resetOutput at the start of every fresh attempt for that stage.
+  private outputBuffers = new Map<string, string>();
+  // Per-stage transcript cap (see pipeline_output migration): generous enough for a real
+  // implement/review pass, small enough that a runaway or looping agent can't grow a job's row
+  // without bound.
+  private static readonly OUTPUT_CAP = 500_000;
 
-  constructor(private db: Db, private events: EventHub, private runner: PipelineRunner, private settings: SettingsService, private concurrency = 1) {}
+  // Fired after every "completed"/"verdict"/"failed" pipeline event -- i.e. right after each
+  // real plan/implement/review CLI turn against Claude or Codex finishes, win or lose. This is
+  // the hook cli-usage-scraper.ts's on-demand reading is meant to run from: piggybacking on a
+  // turn that already just happened is free, and far fresher than any fixed polling interval.
+  constructor(private db: Db, private events: EventHub, private runner: PipelineRunner, private settings: SettingsService, private concurrency = 1, private onCliTurnFinished: () => void = () => {}) {}
 
   private get(id: string) { return mapPrompt(this.db.prepare(`${selectQueue} WHERE id=?`).get(id) as Record<string, unknown> | undefined); }
   list(projectId: string): QueuedPrompt[] { return (this.db.prepare(`${selectQueue} WHERE project_id=? ORDER BY position,created_at`).all(projectId) as Record<string, unknown>[]).map((row) => mapPrompt(row)!); }
+
+  // Called once at server startup (see app.ts). Any row still sitting in one of activeStatuses
+  // at that moment cannot actually be running -- this process just started, and holds no
+  // in-memory job for it -- so it can only mean the previous process died mid-run: a crash, a
+  // kill, a machine restart. Left alone it would sit there forever, looking "in progress" while
+  // nothing is actually driving it. Marking each one failed (with needsAttention set) surfaces
+  // it immediately and makes the existing retry endpoint able to pick it back up: implement/
+  // review failures resume from the worktree already on disk, planning failures start over from
+  // queued.
+  recoverInterruptedJobs(): number {
+    const stuck = this.db.prepare(`SELECT id FROM queued_prompts WHERE status IN (${activeStatuses.map(() => "?").join(",")})`).all(...activeStatuses) as { id: string }[];
+    for (const { id } of stuck) {
+      const item = this.get(id);
+      if (!item) continue;
+      const stage: PipelineStage = item.status === "planning" ? "plan" : item.status === "reviewing" ? "review" : "implement";
+      this.fail(item, stage, new Error("Interrupted by a server restart before this stage finished. Retry to resume."));
+    }
+    return stuck.length;
+  }
 
   add(projectId: string, text: string, runOverrides?: PipelineOverrides, mode: PipelineMode = "full", dispatch: DispatchMode = "queued"): QueuedPrompt {
     if (!text.trim()) throw new Error("Prompt text is required");
@@ -104,8 +136,10 @@ export class QueueService {
       if (current.mode === "implement_only") { await this.runImplementOnly(current, project.path, config); return; }
       this.db.prepare("UPDATE queued_prompts SET status='planning',started_at=?,needs_attention=0,error_message=NULL WHERE id=?").run(new Date().toISOString(), id);
       this.progress(current, "planning"); this.logEvent(current, "plan", "started", `Planning with ${config.plan.model} (${config.plan.effort}).`);
-      const plan = await this.runner.plan({ repo: project.path, prompt: current.text, ...config.plan });
-      this.db.prepare("UPDATE queued_prompts SET status='plan_ready',plan_text=?,plan_original_text=?,review_prompt=?,review_prompt_original_text=?,needs_attention=1 WHERE id=?").run(plan.text, plan.text, plan.reviewPrompt, plan.reviewPrompt, id);
+      this.resetOutput(id, "plan");
+      const plan = await this.runner.plan({ repo: project.path, prompt: current.text, ...config.plan, onOutput: (stream, chunk) => this.captureOutput(current, "plan", stream, chunk, false) });
+      const checkpoints = plan.checkpoints ?? [];
+      this.db.prepare("UPDATE queued_prompts SET status='plan_ready',plan_text=?,plan_original_text=?,plan_summary=?,review_prompt=?,review_prompt_original_text=?,checkpoints=?,checkpoint_index=0,needs_attention=1 WHERE id=?").run(plan.text, plan.text, plan.summary?.trim() || null, plan.reviewPrompt, plan.reviewPrompt, checkpoints.length ? JSON.stringify(checkpoints) : null, id);
       this.logEvent(current, "plan", "completed", "Draft plan completed.");
       this.logEvent(current, "plan", "awaiting_approval", "Plan is ready for human review and approval.");
       this.progress(current, "plan_ready");
@@ -129,7 +163,10 @@ export class QueueService {
     const created = await createWorktree(repo, item.id);
     this.db.prepare("UPDATE queued_prompts SET worktree_path=?,result_branch=?,base_sha=?,plan_approved_at=? WHERE id=?").run(created.worktree, created.branch, created.baseSha, new Date().toISOString(), item.id);
     const current = this.get(item.id)!;
-    const summary = await this.runner.implement({ worktree: created.worktree, planText: item.text, model: config.implement.model, effort: config.implement.effort });
+    this.resetOutput(item.id, "implement");
+    // No plan stage in implement_only mode, so there is no drafted checkpoint list to report
+    // against -- Codex works from the raw prompt directly, with no progress bar to feed.
+    const summary = await this.runner.implement({ worktree: created.worktree, planText: item.text, model: config.implement.model, effort: config.implement.effort, onOutput: (stream, chunk) => this.captureOutput(current, "implement", stream, chunk, false) });
     const dirty = await git(created.worktree, ["status", "--porcelain"]);
     if (dirty) { await git(created.worktree, ["add", "-A"]); await git(created.worktree, ["commit", "-m", `pm: implement ${item.id}`]); }
     this.logEvent(current, "implement", "output", summary);
@@ -171,11 +208,20 @@ export class QueueService {
     try {
       while (true) {
         item = this.get(id)!;
-        const isFix = item.status === "fixing";
+        // A separate `const` so the onOutput closures below capture a definitely-non-null
+        // reference -- TS can't carry the narrowing from `item = this.get(id)!` on the mutable
+        // `let item` into a closure that might run after a later reassignment.
+        const current = item;
+        const isFix = current.status === "fixing";
         this.db.prepare("UPDATE queued_prompts SET status=? WHERE id=?").run(isFix ? "fixing" : "implementing", id);
         this.progress(item, isFix ? "fixing" : "implementing");
         this.logEvent(item, "implement", isFix ? "fix_round_started" : "started", isFix ? `Starting fix round ${item.fixRoundsUsed}.` : `Implementing with ${item.implementModel} (${item.implementEffort}).`);
-        const summary = await this.runner.implement({ worktree: item.worktreePath!, planText: item.planText!, model: item.implementModel!, effort: item.implementEffort!, resume: isFix, feedback: item.reviewNotes ?? undefined });
+        this.resetOutput(id, "implement");
+        // Checkpoint tracking only applies to the initial pass: a fix round works from review
+        // feedback, not the original checkpoint list, so re-tracking against it here would be
+        // meaningless (and checkpoint_index already reflects the first pass's progress).
+        if (!isFix) this.db.prepare("UPDATE queued_prompts SET checkpoint_index=0 WHERE id=?").run(id);
+        const summary = await this.runner.implement({ worktree: item.worktreePath!, planText: item.planText!, model: item.implementModel!, effort: item.implementEffort!, resume: isFix, feedback: item.reviewNotes ?? undefined, checkpoints: isFix ? undefined : (item.checkpoints ?? undefined), onOutput: (stream, chunk) => this.captureOutput(current, "implement", stream, chunk, !isFix) });
         const dirty = await git(item.worktreePath!, ["status", "--porcelain"]);
         if (dirty) {
           await git(item.worktreePath!, ["add", "-A"]);
@@ -186,8 +232,9 @@ export class QueueService {
 
         this.db.prepare("UPDATE queued_prompts SET status='reviewing' WHERE id=?").run(id);
         this.progress(item, "reviewing"); this.logEvent(item, "review", "started", `Reviewing with ${item.reviewModel} (${item.reviewEffort}).`);
+        this.resetOutput(id, "review");
         // A configurable project test command was considered; v1 gates on a successful Codex exit before independent review.
-        const review = await this.runner.review({ worktree: item.worktreePath!, planText: item.planText!, reviewPrompt: item.reviewPrompt ?? "", baseRef: item.baseSha!, model: item.reviewModel!, effort: item.reviewEffort! });
+        const review = await this.runner.review({ worktree: item.worktreePath!, planText: item.planText!, reviewPrompt: item.reviewPrompt ?? "", baseRef: item.baseSha!, model: item.reviewModel!, effort: item.reviewEffort!, onOutput: (stream, chunk) => this.captureOutput(current, "review", stream, chunk, false) });
         this.db.prepare("UPDATE queued_prompts SET review_verdict=?,review_notes=? WHERE id=?").run(review.verdict, review.notes, id);
         this.logEvent(item, "review", "verdict", `${review.verdict}\n${review.notes}`);
         if (review.verdict === "CLEAN") { await this.complete(item, project.path); return; }
@@ -280,6 +327,53 @@ export class QueueService {
     const event: PipelineEvent = { id: nanoid(), promptId: item.id, projectId: item.projectId, stage, kind, message, createdAt: new Date().toISOString() };
     this.db.prepare("INSERT INTO pipeline_events(id,prompt_id,project_id,stage,kind,message,created_at) VALUES(?,?,?,?,?,?,?)").run(event.id, event.promptId, event.projectId, event.stage, event.kind, event.message, event.createdAt);
     this.events.emit({ type: "pipeline.event", projectId: event.projectId, promptId: event.promptId, event });
+    if (kind === "completed" || kind === "verdict" || kind === "failed") this.onCliTurnFinished();
+  }
+
+  // Called once, right before the risky runner call, so a stage's transcript always reflects
+  // its current or most recent attempt -- not this attempt appended after a previous one that
+  // failed or is being retried.
+  private resetOutput(promptId: string, stage: PipelineStage) {
+    const now = new Date().toISOString();
+    this.db.prepare("INSERT INTO pipeline_output(prompt_id,stage,content,truncated,updated_at) VALUES(?,?,'',0,?) ON CONFLICT(prompt_id,stage) DO UPDATE SET content='',truncated=0,updated_at=excluded.updated_at").run(promptId, stage, now);
+    this.outputBuffers.delete(`${promptId}:${stage}`);
+  }
+
+  getOutput(promptId: string): Record<PipelineStage, { content: string; truncated: boolean }> {
+    const rows = this.db.prepare("SELECT stage, content, truncated FROM pipeline_output WHERE prompt_id=?").all(promptId) as { stage: PipelineStage; content: string; truncated: number }[];
+    const result: Record<PipelineStage, { content: string; truncated: boolean }> = { plan: { content: "", truncated: false }, implement: { content: "", truncated: false }, review: { content: "", truncated: false } };
+    for (const row of rows) result[row.stage] = { content: row.content, truncated: Boolean(row.truncated) };
+    return result;
+  }
+
+  // Passed as `onOutput` into the runner's plan/implement/review calls: persists the growing,
+  // capped transcript for this stage and forwards the raw chunk live over the websocket
+  // (job.output). When `trackCheckpoints` is set (the initial, non-fix implement pass only --
+  // see runImplementReviewLoop), it also line-buffers stdout looking for the PM_CHECKPOINT
+  // marker Codex is asked to echo (see buildImplementStdin) and turns a match into a persisted
+  // checkpoint_index update plus a live job.checkpoint event.
+  private captureOutput(item: Pick<QueuedPrompt, "id" | "projectId">, stage: PipelineStage, stream: "stdout" | "stderr", chunk: string, trackCheckpoints: boolean) {
+    const row = this.db.prepare("SELECT content, truncated FROM pipeline_output WHERE prompt_id=? AND stage=?").get(item.id, stage) as { content: string; truncated: number } | undefined;
+    let content = (row?.content ?? "") + chunk;
+    let truncated = Boolean(row?.truncated);
+    if (content.length > QueueService.OUTPUT_CAP) { content = content.slice(content.length - QueueService.OUTPUT_CAP); truncated = true; }
+    const now = new Date().toISOString();
+    if (row) this.db.prepare("UPDATE pipeline_output SET content=?,truncated=?,updated_at=? WHERE prompt_id=? AND stage=?").run(content, Number(truncated), now, item.id, stage);
+    else this.db.prepare("INSERT INTO pipeline_output(prompt_id,stage,content,truncated,updated_at) VALUES(?,?,?,?,?)").run(item.id, stage, content, Number(truncated), now);
+    this.events.emit({ type: "job.output", projectId: item.projectId, promptId: item.id, stage, stream, chunk });
+
+    if (!trackCheckpoints || stream !== "stdout") return;
+    const key = `${item.id}:${stage}`;
+    const pending = (this.outputBuffers.get(key) ?? "") + chunk;
+    const lines = pending.split(/\r?\n/);
+    this.outputBuffers.set(key, lines.pop() ?? ""); // keep the trailing partial line for next time
+    for (const line of lines) {
+      const match = /^PM_CHECKPOINT\s+(\d+)\s*\/\s*(\d+)\s*:\s*(.*)$/.exec(line.trim());
+      if (!match) continue;
+      const index = Number(match[1]); const total = Number(match[2]); const description = match[3]!.trim();
+      this.db.prepare("UPDATE queued_prompts SET checkpoint_index=? WHERE id=?").run(index, item.id);
+      this.events.emit({ type: "job.checkpoint", projectId: item.projectId, promptId: item.id, index, total, description });
+    }
   }
 
   private async acquireSlot(projectId: string): Promise<() => void> {

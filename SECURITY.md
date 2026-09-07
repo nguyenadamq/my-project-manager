@@ -27,10 +27,10 @@ days.
   branch; the app never merges into or pushes from your registered repositories.
 - **Remote access.** If you expose this beyond localhost, do it over your own private network
   (e.g. Tailscale) with the bearer token enabled -- never bind it to a public interface.
-- **Live usage tracking** (optional, on by default) reads claude.ai/chatgpt.com usage pages
-  read-only over Chrome's remote-debugging protocol, bound to `127.0.0.1` only. See the README's
-  "Live usage tracking" section for why that port is a local attack surface if you change the
-  bind address.
+- **Live usage tracking** (optional, on by default) reads usage straight from the `claude`/
+  `codex` CLIs already running on this host -- no browser, no network port of its own, nothing
+  beyond the same subprocess trust boundary as the rest of the pipeline. See the README's "Live
+  usage tracking" section for details.
 
 ## Supported versions
 

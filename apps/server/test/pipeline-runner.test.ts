@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { quoteWindowsArg, runCli } from "../src/services/cli.js";
-import { buildImplementArgs, buildPlanArgs, buildReviewArgs, DEFAULT_REVIEW_PROMPT, extractVerdict, splitPlanAndReviewPrompt } from "../src/services/pipeline-runner.js";
+import { buildImplementArgs, buildImplementStdin, buildPlanArgs, buildReviewArgs, DEFAULT_REVIEW_PROMPT, extractVerdict, splitPlanAndReviewPrompt } from "../src/services/pipeline-runner.js";
 
 describe("pipeline CLI", () => {
   it("closes stdin so a subprocess can exit", async () => {
@@ -33,6 +33,20 @@ describe("pipeline CLI", () => {
   it("pipes the prompt through stdin instead of a CLI argument", async () => {
     const result = await runCli(process.execPath, ["-e", "let data='';process.stdin.setEncoding('utf8');process.stdin.on('data',(chunk)=>data+=chunk);process.stdin.on('end',()=>console.log(data))"], { stdin: "hello from stdin\nwith a newline" });
     expect(result.stdout.trim()).toBe("hello from stdin\nwith a newline");
+  });
+  it("streams chunks to onChunk live, in addition to the final buffered result", async () => {
+    const script = "process.stdout.write('first '); setTimeout(() => { process.stdout.write('second'); process.stderr.write('oops'); }, 20);";
+    const seen: Array<{ stream: "stdout" | "stderr"; text: string }> = [];
+    const result = await runCli(process.execPath, ["-e", script], { onChunk: (stream, text) => seen.push({ stream, text }) });
+    expect(result.stdout).toBe("first second");
+    expect(seen.map((c) => c.text).join("")).toContain("first ");
+    expect(seen.some((c) => c.stream === "stderr" && c.text === "oops")).toBe(true);
+  });
+  it("still decodes a split multi-byte character correctly in onChunk, not just the final result", async () => {
+    const script = "const bytes = Buffer.from([0xE2, 0x82, 0xAC]); process.stdout.write(bytes.subarray(0, 1)); setTimeout(() => process.stdout.write(bytes.subarray(1)), 20);";
+    let streamed = "";
+    await runCli(process.execPath, ["-e", script], { onChunk: (stream, text) => { if (stream === "stdout") streamed += text; } });
+    expect(streamed).toBe("€");
   });
 });
 
@@ -88,6 +102,50 @@ describe("splitPlanAndReviewPrompt", () => {
     const result = splitPlanAndReviewPrompt("Just a plain plan with no sections at all.");
     expect(result.text).toBe("Just a plain plan with no sections at all.");
     expect(result.reviewPrompt).toBe(DEFAULT_REVIEW_PROMPT);
+  });
+  it("parses a checkpoint list out of its own section, leaving the plan and review prompt intact", () => {
+    const result = splitPlanAndReviewPrompt(
+      "## IMPLEMENTATION PLAN\nAdd a NOTES.md file.\n\n## CHECKPOINTS\n1. Create NOTES.md\n2. Write one sentence into it\n\n## REVIEW INSTRUCTIONS\nCheck NOTES.md is one sentence.\n",
+    );
+    expect(result.text).toBe("## IMPLEMENTATION PLAN\nAdd a NOTES.md file.");
+    expect(result.checkpoints).toEqual(["Create NOTES.md", "Write one sentence into it"]);
+    expect(result.reviewPrompt).toBe("Check NOTES.md is one sentence.");
+  });
+  it("ignores prose in the checkpoints section that isn't a numbered list item", () => {
+    const result = splitPlanAndReviewPrompt("## IMPLEMENTATION PLAN\nDo it.\n\n## CHECKPOINTS\nThis is a short intro sentence.\n1. Do the one thing\n\n## REVIEW INSTRUCTIONS\nCheck it.");
+    expect(result.checkpoints).toEqual(["Do the one thing"]);
+  });
+  it("returns an empty checkpoint list when the model skipped the section entirely", () => {
+    const result = splitPlanAndReviewPrompt("## IMPLEMENTATION PLAN\nOne-line change.\n\n## REVIEW INSTRUCTIONS\nCheck it.");
+    expect(result.checkpoints).toEqual([]);
+  });
+  it("extracts a leading SUMMARY section, leaving the rest of the parsing untouched", () => {
+    const result = splitPlanAndReviewPrompt(
+      "## SUMMARY\nAdds a NOTES.md file with one sentence in it.\n\n## IMPLEMENTATION PLAN\nAdd a NOTES.md file.\n\n## CHECKPOINTS\n1. Create NOTES.md\n\n## REVIEW INSTRUCTIONS\nCheck NOTES.md is one sentence.\n",
+    );
+    expect(result.summary).toBe("Adds a NOTES.md file with one sentence in it.");
+    expect(result.text).toBe("## IMPLEMENTATION PLAN\nAdd a NOTES.md file.");
+    expect(result.checkpoints).toEqual(["Create NOTES.md"]);
+    expect(result.reviewPrompt).toBe("Check NOTES.md is one sentence.");
+  });
+  it("leaves the summary empty (not an error) when the model skipped that section", () => {
+    const result = splitPlanAndReviewPrompt("## IMPLEMENTATION PLAN\nOne-line change.\n\n## REVIEW INSTRUCTIONS\nCheck it.");
+    expect(result.summary).toBe("");
+    expect(result.text).toBe("## IMPLEMENTATION PLAN\nOne-line change.");
+  });
+});
+
+describe("buildImplementStdin", () => {
+  it("passes the plan through unchanged when there are no checkpoints", () => {
+    expect(buildImplementStdin("Do the thing.", undefined)).toBe("Do the thing.");
+    expect(buildImplementStdin("Do the thing.", [])).toBe("Do the thing.");
+  });
+  it("appends PM_CHECKPOINT reporting instructions listing every checkpoint in order", () => {
+    const stdin = buildImplementStdin("Do the thing.", ["Add the migration", "Wire up the route"]);
+    expect(stdin).toContain("Do the thing.");
+    expect(stdin).toContain("1. Add the migration");
+    expect(stdin).toContain("2. Wire up the route");
+    expect(stdin).toContain('PM_CHECKPOINT 1/2:');
   });
 });
 

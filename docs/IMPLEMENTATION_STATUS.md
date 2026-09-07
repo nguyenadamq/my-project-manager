@@ -8,11 +8,11 @@ Each queued prompt also picks a pipeline `mode`, set at add-time and immutable a
 
 Claude and Codex are both invoked through their own subscription CLI login: `cli.ts` strips any `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` from the subprocess environment before every spawn (so the server's own summary-synthesis key never leaks into the coding-agent subprocesses) and pipes the prompt/plan/feedback text through stdin instead of a CLI argument, avoiding Windows' command-line length limit on large repository context.
 
-Usage tracking now has a live source: `usage-scraper.ts` attaches over CDP to a dedicated Chrome profile (launched by `scripts/launch-chrome-debug.ps1`) on an interval, reading the real percentages and reset times from claude.ai's and chatgpt.com's own usage pages and normalizing both to "% used". The profile can't be the user's default one -- Chrome refuses to open a debugging port on the default profile at all, unconditionally -- but the launch script's first run opens a plain, non-automated Chrome window already pointed at both pages for the user to sign into once; automation only reads pages afterward, over CDP, and never drives that login. (An earlier version drove the login itself through Playwright's `launchPersistentContext`, which reliably tripped both sites' Cloudflare-backed anti-bot defenses; this doesn't, since nothing automated touches the page until after a human has already signed in normally.) `UsageService.snapshot()` prefers a fresh live reading per pool, falling back to a local-transcript estimate (Claude session only), a manual-log estimate (Codex weekly only), or `"unknown"` -- never a fabricated number.
+Usage tracking has a live source: `cli-usage-scraper.ts` asks the two CLIs their own account-usage answers directly -- `claude -p "/usage" --output-format json`, and, since Codex has no scriptable equivalent, its interactive `/status` panel driven headlessly through a real pseudo-terminal (`cli-usage.ts`, via `node-pty`). No browser, no separate sign-in: both reads are local and free. A fresh read is triggered opportunistically after every real plan/implement/review CLI turn (`queue.ts`'s `onCliTurnFinished`), with `usageScrapeIntervalMs` only as a fallback heartbeat for an idle app. `UsageService.snapshot()` prefers a fresh live reading per pool, falling back to a local-transcript estimate (Claude session only), a manual-log estimate (Codex weekly only), or `"unknown"` -- never a fabricated number. (An earlier version of this feature attached over CDP to a dedicated, manually-signed-in Chrome profile; that approach worked but required a browser window kept running at all times purely for this, which the CLI-based reads make unnecessary.)
 
 Auto-dispatch (`auto-dispatch.ts`, off by default via `/api/settings/auto-dispatch`) periodically finds the highest-priority, oldest-waiting queued or plan-ready item across every project whose required usage pools -- Codex only for `implement_only`, both Claude and Codex for `full` -- are under a configurable threshold, and starts it: pushing a queued item, or approving and implementing a plan already sitting in `plan_ready`. Projects carry a `priority` integer (dashboard-orderable) used to break ties.
 
-Pipeline configuration is resolved in global → project → run order and the final model/effort choices are snapshotted on the queue item before planning starts. Pipeline transitions and outputs are persisted as events and broadcast live to the PWA. Existing databases are upgraded through tracked, idempotent SQL migrations; legacy `running` items are recovered as failed items needing attention.
+Pipeline configuration is resolved in global → project → run order and the final model/effort choices are snapshotted on the queue item before planning starts. Pipeline transitions and outputs are persisted as events and broadcast live to the PWA. Existing databases are upgraded through tracked, idempotent SQL migrations; a row still in a subprocess-driven status (`planning`/`implementing`/`reviewing`/`fixing`) when the server boots -- which can only mean the previous process died mid-run -- is recovered as a `failed` item needing attention (`queue.ts`'s `recoverInterruptedJobs`, called once at startup), rather than sitting stuck forever with nothing actually driving it.
 
 The PWA includes stage timelines, attention badges, plan editing and approval, review findings, explicit extra-fix controls, event logs, run overrides, and a global pipeline settings dialog. The source repository remains untouched throughout implementation and review: Project Manager never merges or pushes the generated branch. A `failed` item can be retried in place (`POST /api/queue/:promptId/retry`) rather than only cancelled: it resumes the existing worktree if implement/review is what failed, or starts over from `queued` if planning never got that far.
 
@@ -63,3 +63,34 @@ cross-platform Node script, so Windows, macOS, and Linux all follow the same REA
 The five test files that each hardcoded the same list of migration filenames now read the
 migrations directory instead -- adding `005_dispatch_mode.sql` would otherwise have broken all
 five with failures that say nothing about the code under test.
+
+## Production-readiness pass (2026-09-07)
+
+1. **Registering a project could wrongly fail on macOS.** `projects.ts`/`browse.ts` compared a
+   `fs.realpath`'d requested path against `PM_ALLOWED_ROOTS` roots that were *not* themselves
+   realpath'd -- on macOS, where `/tmp` and `/var` are themselves symlinks into `/private`, a
+   root pointed at either (or any other symlinked folder) never matched, rejecting every real
+   project underneath it as "outside PM_ALLOWED_ROOTS". Both call sites now resolve each
+   configured root through the same realpath at comparison time; `config.ts`'s `loadConfig` does
+   the same once at startup as a first line of defense.
+2. **A scrape in flight during shutdown could crash the process.** `cli-usage-scraper.ts`'s
+   `stop()` only cleared its timers; a scrape already running when `onClose` closed the database
+   would still try to write into it moments later, throwing "database is not open" as an
+   unhandled rejection. `stop()` now flips a guard immediately (no new scrape can start) and a
+   separate `settle()` lets whatever was already running finish before the database goes away;
+   `app.ts`'s shutdown hook calls both in the right order relative to draining other background
+   work.
+3. **A job interrupted by a crash stayed stuck forever, looking like it was still running.**
+   Nothing recovered a row left in `planning`/`implementing`/`reviewing`/`fixing` by a process
+   that died mid-run, despite an earlier note above claiming legacy `running` items were
+   recovered -- they weren't. `queue.ts`'s new `recoverInterruptedJobs()`, called once at startup,
+   now marks every such row `failed` with `needsAttention` set, so it surfaces immediately and
+   the existing retry endpoint can pick it back up.
+4. **Live usage tracking's Chrome/CDP path is gone**, replaced entirely by the CLI-based reads
+   described above -- `usage-scraper.ts`, `scripts/launch-chrome-debug.mjs`, the `playwright-core`
+   dependency, `pnpm usage:chrome`, and every `PM_CHROME_*`/`PM_USAGE_PROFILE_PATH` env var are
+   removed. One fewer moving part to keep running, no browser profile to sign into or maintain.
+5. **Test files were never typechecked.** `tsconfig.json`'s `include` is `src` only, so `lint`/
+   `typecheck` silently never caught a type error in `test/**` -- which is exactly how #1's fix
+   would have gone unnoticed if a test config object had drifted from `Config`'s real shape. Both
+   scripts now also run a new `tsconfig.test.json` covering `src` + `test`.
